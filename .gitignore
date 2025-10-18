@@ -44,3 +44,14 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 assets/models/*.onnx
+# Ignore all model files under assets/models, but keep configs directory
+assets/models/*
+!assets/models/configs/
+!assets/models/configs/**
+
+# Optional: also ignore common weight formats anywhere
+*.onnx
+*.pt
+*.pth
+*.bin
+*.weights
