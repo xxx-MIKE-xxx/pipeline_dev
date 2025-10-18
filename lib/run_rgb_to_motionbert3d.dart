@@ -7,7 +7,7 @@ import 'dart:typed_data';
 import 'package:ffmpeg_kit_flutter_min_gpl/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_min_gpl/return_code.dart';
 import 'package:flutter/services.dart' show rootBundle;
-import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
+import 'package:flutter_onnxruntime/flutter_onnxruntime.dart' as ort;
 import 'package:image/image.dart' as img;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -48,9 +48,9 @@ class PosePipeline {
   final Map<String, dynamic> yoloCfg;
   final Map<String, dynamic> rtmCfg;
   final Map<String, dynamic> motionCfg;
-  final OrtSession yoloSession;
-  final OrtSession rtmSession;
-  final OrtSession motionSession;
+  final ort.OrtSession yoloSession;
+  final ort.OrtSession rtmSession;
+  final ort.OrtSession motionSession;
   final String yoloInputName;
   final String rtmInputName;
   final String motionInputName;
@@ -66,9 +66,9 @@ class PosePipeline {
     final rtmModel = await _materializeModelAsset(cfgDir, rtmCfg, cacheDir);
     final motionModel = await _materializeModelAsset(cfgDir, motionCfg, cacheDir);
 
-    final yoloSession = await OrtSession.fromFile(yoloModel.path);
-    final rtmSession = await OrtSession.fromFile(rtmModel.path);
-    final motionSession = await OrtSession.fromFile(motionModel.path);
+    final yoloSession = await ort.OrtSession.fromFile(yoloModel.path);
+    final rtmSession = await ort.OrtSession.fromFile(rtmModel.path);
+    final motionSession = await ort.OrtSession.fromFile(motionModel.path);
 
     return PosePipeline._(
       yoloCfg: yoloCfg,
@@ -272,73 +272,47 @@ class PosePipeline {
   }
 
   Future<Float32List> _runYolo(Float32List input, List<int> shape) async {
-    final tensor = OrtValueTensor.createTensorWithDataList(input, shape);
-    final dynamic outputs = await yoloSession.run(ortInputs: {yoloInputName: tensor});
-    final dynamic first = _firstOrtValue(outputs);
-    final value = first?.value;
-    if (value is Float32List) {
-      return Float32List.fromList(value.toList());
+    final tensor = ort.OrtValueTensor.createTensorFloat32(input, shape);
+    final outputs = await yoloSession.runAsync({yoloInputName: tensor});
+    tensor.close();
+    try {
+      final first = outputs.first.value as Float32List;
+      return Float32List.fromList(first.toList());
+    } finally {
+      for (final out in outputs) {
+        out.close();
+      }
     }
-    if (value is List) {
-      return Float32List.fromList(value.cast<double>());
-    }
-    throw const PosePipelineException('Unexpected YOLO output type');
   }
 
   Future<_RtmResult> _runRtm(Float32List input, List<int> shape) async {
-    final tensor = OrtValueTensor.createTensorWithDataList(input, shape);
-    final dynamic outputs = await rtmSession.run(ortInputs: {rtmInputName: tensor});
-    if (outputs is List && outputs.length >= 2) {
-      final first = outputs[0];
-      final second = outputs[1];
-      final firstValue = (first as dynamic).value;
-      final secondValue = (second as dynamic).value;
-      final simccX = firstValue is Float32List
-          ? Float32List.fromList(firstValue.toList())
-          : Float32List.fromList((firstValue as List).cast<double>());
-      final simccY = secondValue is Float32List
-          ? Float32List.fromList(secondValue.toList())
-          : Float32List.fromList((secondValue as List).cast<double>());
+    final tensor = ort.OrtValueTensor.createTensorFloat32(input, shape);
+    final outputs = await rtmSession.runAsync({rtmInputName: tensor});
+    tensor.close();
+    try {
+      final simccX = Float32List.fromList((outputs[0].value as Float32List).toList());
+      final simccY = Float32List.fromList((outputs[1].value as Float32List).toList());
       return _RtmResult(simccX: simccX, simccY: simccY);
+    } finally {
+      for (final out in outputs) {
+        out.close();
+      }
     }
-    if (outputs is Map && outputs.length >= 2) {
-      final values = outputs.values.toList();
-      final firstValue = (values[0] as dynamic).value;
-      final secondValue = (values[1] as dynamic).value;
-      final simccX = firstValue is Float32List
-          ? Float32List.fromList(firstValue.toList())
-          : Float32List.fromList((firstValue as List).cast<double>());
-      final simccY = secondValue is Float32List
-          ? Float32List.fromList(secondValue.toList())
-          : Float32List.fromList((secondValue as List).cast<double>());
-      return _RtmResult(simccX: simccX, simccY: simccY);
-    }
-    throw const PosePipelineException('Unexpected RTM output type');
   }
 
   Future<Float32List> _runMotionBert(Float32List input, {required int sequenceLength}) async {
-    final tensor = OrtValueTensor.createTensorWithDataList(input, [1, sequenceLength, 17, 3]);
-    final dynamic outputs = await motionSession.run(ortInputs: {motionInputName: tensor});
-    final dynamic first = _firstOrtValue(outputs);
-    final value = first?.value;
-    if (value is Float32List) {
-      return Float32List.fromList(value.toList());
+    final tensor = ort.OrtValueTensor.createTensorFloat32(input, [1, sequenceLength, 17, 3]);
+    final outputs = await motionSession.runAsync({motionInputName: tensor});
+    tensor.close();
+    try {
+      final first = outputs.first.value as Float32List;
+      return Float32List.fromList(first.toList());
+    } finally {
+      for (final out in outputs) {
+        out.close();
+      }
     }
-    if (value is List) {
-      return Float32List.fromList(value.cast<double>());
-    }
-    throw const PosePipelineException('Unexpected MotionBERT output type');
   }
-}
-
-dynamic _firstOrtValue(dynamic outputs) {
-  if (outputs is List && outputs.isNotEmpty) {
-    return outputs.first;
-  }
-  if (outputs is Map && outputs.isNotEmpty) {
-    return outputs.values.first;
-  }
-  return null;
 }
 
 class _RtmResult {
@@ -417,8 +391,7 @@ Future<void> _extractFrames(File videoFile, Directory framesDir) async {
   final session = await FFmpegKit.execute(command);
   final code = await session.getReturnCode();
   if (!ReturnCode.isSuccess(code)) {
-    final value = code?.getValue();
-    throw PosePipelineException('FFmpeg failed with code ${value ?? 'unknown'}');
+    throw PosePipelineException('FFmpeg failed with code ${ReturnCode.getReturnCode(code)}');
   }
 }
 
@@ -444,11 +417,7 @@ _LetterboxResult _letterbox(
   }
   final dx = ((targetW - resized.width) / 2).floor();
   final dy = ((targetH - resized.height) / 2).floor();
-  for (var y = 0; y < resized.height; y++) {
-    for (var x = 0; x < resized.width; x++) {
-      canvas.setPixel(dx + x, dy + y, resized.getPixel(x, y));
-    }
-  }
+  img.copyInto(canvas, resized, dstX: dx, dstY: dy);
   return _LetterboxResult(
     image: canvas,
     scale: scale,
@@ -465,22 +434,16 @@ Float32List _imageToFloat32Nchw(img.Image image, {required double scale}) {
       for (var x = 0; x < image.width; x++) {
         final pixel = image.getPixel(x, y);
         final channelValue = c == 0
-            ? _getRed(pixel)
+            ? img.getRed(pixel)
             : c == 1
-                ? _getGreen(pixel)
-                : _getBlue(pixel);
+                ? img.getGreen(pixel)
+                : img.getBlue(pixel);
         tensor[offset++] = channelValue * scale;
       }
     }
   }
   return tensor;
 }
-
-int _getRed(int color) => color & 0xFF;
-
-int _getGreen(int color) => (color >> 8) & 0xFF;
-
-int _getBlue(int color) => (color >> 16) & 0xFF;
 
 _YoloDetection? _decodeYolo(
   Float32List raw, {
@@ -644,9 +607,9 @@ Float32List _prepareRtmInput(img.Image crop, {required String mode, List<double>
     for (var y = 0; y < crop.height; y++) {
       for (var x = 0; x < crop.width; x++) {
         final pixel = crop.getPixel(x, y);
-        final r = _getRed(pixel).toDouble();
-        final g = _getGreen(pixel).toDouble();
-        final b = _getBlue(pixel).toDouble();
+        final r = img.getRed(pixel).toDouble();
+        final g = img.getGreen(pixel).toDouble();
+        final b = img.getBlue(pixel).toDouble();
         double value;
         if (normalizedMode.startsWith('rgb')) {
           value = c == 0 ? r : c == 1 ? g : b;

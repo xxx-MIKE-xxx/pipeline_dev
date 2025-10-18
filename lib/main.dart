@@ -112,12 +112,10 @@ class _PoseHomePageState extends State<PoseHomePage> {
       return;
     }
 
-    final files = <File>[];
-    await for (final entity in result.runDirectory.list(recursive: true)) {
-      if (entity is File) {
-        files.add(entity);
-      }
-    }
+    final files = await result.runDirectory
+        .list(recursive: true)
+        .whereType<File>()
+        .toList();
     if (files.isEmpty) {
       return;
     }
@@ -176,22 +174,19 @@ class _PoseHomePageState extends State<PoseHomePage> {
                           const SizedBox(height: 8),
                           Expanded(
                             child: Card(
-                              child: Builder(
-                                builder: (context) {
-                                  final entries = _lastResult!.outputs.entries.toList()
-                                    ..sort((a, b) => a.key.compareTo(b.key));
-                                  return ListView(
-                                    children: [
-                                      for (final entry in entries)
-                                        ListTile(
-                                          dense: true,
-                                          title: Text(entry.key),
-                                          subtitle: Text(entry.value.path),
-                                          leading: const Icon(Icons.insert_drive_file),
-                                        ),
-                                    ],
-                                  );
-                                },
+                              child: ListView(
+                                children: _lastResult!.outputs.entries
+                                    .toList()
+                                    ..sort((a, b) => a.key.compareTo(b.key))
+                                    .map(
+                                      (entry) => ListTile(
+                                        dense: true,
+                                        title: Text(entry.key),
+                                        subtitle: Text(entry.value.path),
+                                        leading: const Icon(Icons.insert_drive_file),
+                                      ),
+                                    )
+                                    .toList(),
                               ),
                             ),
                           ),
