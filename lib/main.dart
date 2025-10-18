@@ -1,207 +1,109 @@
 import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:share_plus/share_plus.dart';
+
+// Legacy API (pre-11)
+import 'package:share_plus/share_plus.dart'; // provides Share.shareXFiles
+import 'package:cross_file/cross_file.dart';
 
 import 'run_rgb_to_motionbert3d.dart';
 
-void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const PoseApp());
-}
+void main() => runApp(const PoseApp());
 
 class PoseApp extends StatelessWidget {
   const PoseApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'MotionBERT Pipeline',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-        useMaterial3: true,
-      ),
-      home: const PoseHomePage(),
+      title: 'Pose Estimation',
+      theme: ThemeData(useMaterial3: true),
+      home: const PoseHome(),
     );
   }
 }
 
-class PoseHomePage extends StatefulWidget {
-  const PoseHomePage({super.key});
-
+class PoseHome extends StatefulWidget {
+  const PoseHome({super.key});
   @override
-  State<PoseHomePage> createState() => _PoseHomePageState();
+  State<PoseHome> createState() => _PoseHomeState();
 }
 
-class _PoseHomePageState extends State<PoseHomePage> {
-  PosePipeline? _pipeline;
-  PoseRunResult? _lastResult;
-  bool _initializing = true;
-  bool _running = false;
-  String _status = 'Preparing models...';
-  String? _error;
+class _PoseHomeState extends State<PoseHome> {
+  String? _lastRunDir;
+  bool _busy = false;
+  String _log = '';
 
-  @override
-  void initState() {
-    super.initState();
-    _initialisePipeline();
-  }
-
-  Future<void> _initialisePipeline() async {
-    try {
-      final pipeline = await PosePipeline.create();
-      if (!mounted) return;
-      setState(() {
-        _pipeline = pipeline;
-        _status = 'Ready';
-        _initializing = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _initializing = false;
-        _error = e.toString();
-        _status = 'Failed to initialise';
-      });
-    }
-  }
-
-  Future<void> _pickAndProcess() async {
-    final pipeline = _pipeline;
-    if (pipeline == null || _running) {
-      return;
-    }
-
+  Future<void> _pickAndRun() async {
     final picker = ImagePicker();
     final picked = await picker.pickVideo(source: ImageSource.gallery);
-    if (picked == null) {
-      return;
-    }
+    if (picked == null) return;
 
-    setState(() {
-      _running = true;
-      _status = 'Processing ${picked.name}...';
-      _error = null;
-    });
+    setState(() { _busy = true; _log = 'Running YOLO → RTMPose → MotionBERT…'; });
 
     try {
-      final result = await pipeline.processVideo(File(picked.path));
-      if (!mounted) return;
+      final outDirPath = await runPipelineOnVideo(File(picked.path));
       setState(() {
-        _lastResult = result;
-        _status = 'Completed (${result.frameCount} frames)';
+        _lastRunDir = outDirPath;
+        _log = 'Done.\nSaved results to:\n$outDirPath\n\n'
+               'Files:\n- yolo_out.json\n- rtm_out.json\n- motionbert_out.json';
       });
     } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _error = e.toString();
-        _status = 'Processing failed';
-      });
+      setState(() => _log = 'Error: $e');
     } finally {
-      if (!mounted) return;
-      setState(() {
-        _running = false;
-      });
+      setState(() => _busy = false);
     }
   }
 
   Future<void> _shareResults() async {
-    final result = _lastResult;
-    if (result == null) {
-      return;
-    }
-
-    final files = await result.runDirectory
-        .list(recursive: true)
-        .whereType<File>()
-        .toList();
-    if (files.isEmpty) {
-      return;
-    }
-
-    final xfiles = files.map((file) => XFile(file.path)).toList();
-    await Share.shareXFiles(
-      xfiles,
-      text: 'MotionBERT pipeline outputs for ${result.frameCount} frames.',
-      subject: 'MotionBERT Pose Results',
-    );
+    if (_lastRunDir == null) return;
+    final dir = Directory(_lastRunDir!);
+    final files = [
+      XFile('${dir.path}/yolo_out.json'),
+      XFile('${dir.path}/rtm_out.json'),
+      XFile('${dir.path}/motionbert_out.json'),
+    ];
+    await Share.shareXFiles(files, text: 'Pose estimation results');
   }
 
   @override
   Widget build(BuildContext context) {
+    final canShare = _lastRunDir != null && !_busy;
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('RGB → MotionBERT Pipeline'),
-      ),
-      body: _initializing
-          ? const Center(child: CircularProgressIndicator())
-          : Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Text('Status: $_status'),
-                  if (_error != null) ...[
-                    const SizedBox(height: 8),
-                    Text(
-                      _error!,
-                      style: const TextStyle(color: Colors.redAccent),
-                    ),
-                  ],
-                  const SizedBox(height: 16),
-                  ElevatedButton.icon(
-                    onPressed: (_pipeline == null || _running) ? null : _pickAndProcess,
-                    icon: const Icon(Icons.video_library),
-                    label: const Text('Select video from gallery'),
-                  ),
-                  if (_running) ...[
-                    const SizedBox(height: 12),
-                    const LinearProgressIndicator(),
-                  ],
-                  const SizedBox(height: 16),
-                  if (_lastResult != null)
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          Text(
-                            'Run folder: ${_lastResult!.runDirectory.path}',
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                          const SizedBox(height: 12),
-                          Text('Generated files', style: Theme.of(context).textTheme.titleMedium),
-                          const SizedBox(height: 8),
-                          Expanded(
-                            child: Card(
-                              child: ListView(
-                                children: _lastResult!.outputs.entries
-                                    .toList()
-                                    ..sort((a, b) => a.key.compareTo(b.key))
-                                    .map(
-                                      (entry) => ListTile(
-                                        dense: true,
-                                        title: Text(entry.key),
-                                        subtitle: Text(entry.value.path),
-                                        leading: const Icon(Icons.insert_drive_file),
-                                      ),
-                                    )
-                                    .toList(),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          ElevatedButton.icon(
-                            onPressed: _running ? null : _shareResults,
-                            icon: const Icon(Icons.ios_share),
-                            label: const Text('Share results'),
-                          ),
-                        ],
-                      ),
-                    ),
-                ],
+      appBar: AppBar(title: const Text('YOLO → RTMPose → MotionBERT')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            ElevatedButton.icon(
+              onPressed: _busy ? null : _pickAndRun,
+              icon: const Icon(Icons.upload),
+              label: const Text('Pick video from gallery'),
+            ),
+            const SizedBox(height: 12),
+            if (_lastRunDir != null)
+              SelectableText('Output: $_lastRunDir', maxLines: 4),
+            const SizedBox(height: 12),
+            Expanded(
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.black12),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: SingleChildScrollView(child: Text(_log)),
               ),
             ),
+            if (_lastRunDir != null)
+              ElevatedButton.icon(
+                onPressed: canShare ? _shareResults : null,
+                icon: const Icon(Icons.share),
+                label: const Text('Share results'),
+              ),
+          ],
+        ),
+      ),
     );
   }
 }

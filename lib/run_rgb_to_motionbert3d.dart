@@ -1,968 +1,649 @@
-import 'dart:async';
+// Output-equivalent pipeline to your Python run_rgb_to_motionbert3d_patched_v5.py
+// - Reads JSON cfgs from assets/models/configs
+// - YOLO -> RTMPose (SimCC) -> COCO->H36M -> MotionBERT
+// - Saves yolo_out.json, rtm_out.json, motionbert_out.json to Documents/run_<ts>/
+//
+// Requires pubspec deps:
+//   flutter_onnxruntime, image, ffmpeg_kit_flutter_new, path_provider, image_picker, share_plus
+//
+// iOS tip: if you’re on iOS 18+, prefer --profile / --release for now due to a
+// temporary debug-mode issue in Flutter (see Flutter issue tracker).
+
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:ffmpeg_kit_flutter_min_gpl/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_min_gpl/return_code.dart';
 import 'package:flutter/services.dart' show rootBundle;
-import 'package:flutter_onnxruntime/flutter_onnxruntime.dart' as ort;
+import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
 import 'package:image/image.dart' as img;
-import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 
-class PosePipelineException implements Exception {
-  const PosePipelineException(this.message);
-  final String message;
+typedef ProgressCb = void Function(double progress, String stage);
 
-  @override
-  String toString() => 'PosePipelineException: $message';
+class _Cfg {
+  // YOLO
+  late String yoloModelAsset;
+  int yoloInH = 640, yoloInW = 640;
+  int personClassId = 0;
+  double confTh = 0.25, iouTh = 0.45;
+  String classScoreActivation = 'sigmoid'; // or 'none'
+  String yoloUnits = 'normalized'; // or 'pixels'
+  String yoloCoords = 'letterbox'; // or 'original'
+
+  // RTM
+  late String rtmModelAsset;
+  int rtmInH = 256, rtmInW = 192;
+  // preprocess: one of: rgb_255, bgr_255, rgb_ms, bgr_ms
+  String rtmPreproc = 'rgb_255';
+  List<double> rtmMean = [0, 0, 0];
+  List<double> rtmStd = [255, 255, 255];
+  double simccRatio = 2.0;
+
+  // MotionBERT
+  late String mbModelAsset;
+  int T = 243;
+  bool wrapPad = true;
+  bool rootRel = false;
+
+  // skeleton orders (fallback defaults)
+  List<String> cocoOrder = const [
+    "Nose","LEye","REye","LEar","REar",
+    "LShoulder","RShoulder","LElbow","RElbow",
+    "LWrist","RWrist","LHip","RHip",
+    "LKnee","RKnee","LAnkle","RAnkle"
+  ];
+  List<String> h36mOrder = const [
+    "Pelvis","RHip","RKnee","RAnkle","LHip","LKnee","LAnkle",
+    "Spine1","Neck","Head","Site","LShoulder","LElbow","LWrist",
+    "RShoulder","RElbow","RWrist"
+  ];
 }
 
-class PoseRunResult {
-  const PoseRunResult({
-    required this.runDirectory,
-    required this.frameCount,
-    required this.outputs,
-  });
+class OutputEquivRunner {
+  final _Cfg cfg = _Cfg();
+  late final OnnxRuntime _ort;
+  late final OrtSession _yolo, _rtm, _mb;
 
-  final Directory runDirectory;
-  final int frameCount;
-  final Map<String, File> outputs;
-}
+  late final String _yoloInName, _rtmInName, _mbInName;
+  late final List<String> _yoloOutNames, _rtmOutNames, _mbOutNames;
 
-class PosePipeline {
-  PosePipeline._({
-    required this.yoloCfg,
-    required this.rtmCfg,
-    required this.motionCfg,
-    required this.yoloSession,
-    required this.rtmSession,
-    required this.motionSession,
-    required this.yoloInputName,
-    required this.rtmInputName,
-    required this.motionInputName,
-  });
+  List<double>? _prevBox; // xyxy pixels from last frame
 
-  final Map<String, dynamic> yoloCfg;
-  final Map<String, dynamic> rtmCfg;
-  final Map<String, dynamic> motionCfg;
-  final ort.OrtSession yoloSession;
-  final ort.OrtSession rtmSession;
-  final ort.OrtSession motionSession;
-  final String yoloInputName;
-  final String rtmInputName;
-  final String motionInputName;
+  Future<void> initFromAssets({ProgressCb? onProgress}) async {
+    onProgress?.call(0.01, 'Loading configs');
 
-  static Future<PosePipeline> create() async {
-    const cfgDir = 'assets/models/configs';
-    final yoloCfg = jsonDecode(await rootBundle.loadString('$cfgDir/yolo.cfg')) as Map<String, dynamic>;
-    final rtmCfg = jsonDecode(await rootBundle.loadString('$cfgDir/rtm.cfg')) as Map<String, dynamic>;
-    final motionCfg = jsonDecode(await rootBundle.loadString('$cfgDir/motionbert.cfg')) as Map<String, dynamic>;
+    // Load cfgs
+    final yoloCfg = jsonDecode(await rootBundle.loadString('assets/models/configs/yolo.cfg')) as Map;
+    final rtmCfg  = jsonDecode(await rootBundle.loadString('assets/models/configs/rtm.cfg')) as Map;
+    final mbCfg   = jsonDecode(await rootBundle.loadString('assets/models/configs/motionbert.cfg')) as Map;
 
-    final cacheDir = await _ensureModelCache();
-    final yoloModel = await _materializeModelAsset(cfgDir, yoloCfg, cacheDir);
-    final rtmModel = await _materializeModelAsset(cfgDir, rtmCfg, cacheDir);
-    final motionModel = await _materializeModelAsset(cfgDir, motionCfg, cacheDir);
+    // skeletons.json (optional orders)
+    try {
+      final sk = jsonDecode(await rootBundle.loadString('assets/models/configs/skeletons.json')) as Map;
+      if (sk['coco17'] is List) {
+        cfg.cocoOrder = (sk['coco17'] as List).cast<String>();
+      }
+      if (sk['h36m17'] is List) {
+        cfg.h36mOrder = (sk['h36m17'] as List).cast<String>();
+      }
+    } catch (_) {/* keep defaults */}
 
-    final yoloSession = await ort.OrtSession.fromFile(yoloModel.path);
-    final rtmSession = await ort.OrtSession.fromFile(rtmModel.path);
-    final motionSession = await ort.OrtSession.fromFile(motionModel.path);
+    // YOLO cfg
+    cfg.yoloModelAsset = (yoloCfg['model']?['path'] ?? 'assets/models/yolo.onnx') as String;
+    final yIn = (yoloCfg['model']?['input'] ?? {}) as Map;
+    cfg.yoloInH = (yIn['target_height'] ?? yIn['height'] ?? 640) as int;
+    cfg.yoloInW = (yIn['target_width']  ?? yIn['width']  ?? 640) as int;
+    final yOut = (yoloCfg['model']?['output'] ?? {}) as Map;
+    cfg.personClassId = (yOut['classes']?['person_id'] ?? 0) as int;
+    cfg.classScoreActivation = (yOut['class_score_activation'] ?? 'sigmoid') as String;
+    final yDom = (yOut['domain'] ?? {}) as Map;
+    cfg.yoloUnits = (yDom['units'] ?? 'normalized') as String;
+    cfg.yoloCoords= (yDom['coords'] ?? 'letterbox') as String;
+    final yPost = (yoloCfg['postprocess'] ?? {}) as Map;
+    cfg.confTh = (yPost['conf_threshold'] ?? 0.25).toDouble();
+    cfg.iouTh  = (yPost['iou_threshold']  ?? 0.45).toDouble();
 
-    return PosePipeline._(
-      yoloCfg: yoloCfg,
-      rtmCfg: rtmCfg,
-      motionCfg: motionCfg,
-      yoloSession: yoloSession,
-      rtmSession: rtmSession,
-      motionSession: motionSession,
-      yoloInputName: yoloSession.inputNames.first,
-      rtmInputName: rtmSession.inputNames.first,
-      motionInputName: motionSession.inputNames.first,
-    );
+    // RTM cfg
+    cfg.rtmModelAsset = (rtmCfg['model']?['path'] ?? 'assets/models/rtmpose.onnx') as String;
+    final rIn = (rtmCfg['model']?['input'] ?? {}) as Map;
+    cfg.rtmInH = (rIn['target_height'] ?? rIn['height'] ?? 256) as int;
+    cfg.rtmInW = (rIn['target_width']  ?? rIn['width']  ?? 192) as int;
+    final rPre = (rIn['preprocess'] ?? {}) as Map;
+    cfg.rtmPreproc = (rPre['mode'] ?? 'rgb_255') as String;
+    if (cfg.rtmPreproc.endsWith('_ms')) {
+      cfg.rtmMean = (rPre['mean'] ?? [123.675, 116.28, 103.53]).cast<num>().map((e) => e.toDouble()).toList();
+      cfg.rtmStd  = (rPre['std']  ?? [58.395, 57.12, 57.375]).cast<num>().map((e) => e.toDouble()).toList();
+    } else {
+      cfg.rtmMean = [0,0,0];
+      cfg.rtmStd  = [255,255,255];
+    }
+    final rOut = (rtmCfg['model']?['output'] ?? {}) as Map;
+    cfg.simccRatio = ((rOut['simcc'] ?? {}) as Map)['split_ratio']?.toDouble() ?? 2.0;
+
+    // MB cfg
+    cfg.mbModelAsset = (mbCfg['model']?['path'] ?? 'assets/models/motionbert.onnx') as String;
+    cfg.T = (mbCfg['model']?['input']?['sequence_length'] ?? 243) as int;
+    cfg.rootRel = (mbCfg['model']?['output']?['root_relative'] ?? false) as bool;
+    cfg.wrapPad = (mbCfg['runtime']?['wrap_pad_sequence'] ?? true) as bool;
+
+    // Create sessions
+    onProgress?.call(0.06, 'Creating ONNX sessions');
+    _ort = OnnxRuntime();
+    final opts = OrtSessionOptions(providers: const [OrtProvider.XNNPACK]);
+    _yolo = await _ort.createSessionFromAsset(cfg.yoloModelAsset, options: opts);
+    _rtm  = await _ort.createSessionFromAsset(cfg.rtmModelAsset,  options: opts);
+    _mb   = await _ort.createSessionFromAsset(cfg.mbModelAsset,   options: opts);
+
+    _yoloInName  = _yolo.inputNames.first;
+    _rtmInName   = _rtm.inputNames.first;
+    _mbInName    = _mb.inputNames.first;
+    _yoloOutNames= _yolo.outputNames.toList();
+    _rtmOutNames = _rtm.outputNames.toList(); // expect 2
+    _mbOutNames  = _mb.outputNames.toList();
   }
 
-  Future<PoseRunResult> processVideo(File videoFile) async {
-    if (!await videoFile.exists()) {
-      throw PosePipelineException('Video file not found: ${videoFile.path}');
+  /// Runs the full pipeline on a video file path. Returns output folder path.
+  Future<String> runOnVideo(File videoFile, {ProgressCb? onProgress}) async {
+    final docs = await getApplicationDocumentsDirectory();
+    final outDir = Directory('${docs.path}/run_${_ts()}');
+    await outDir.create(recursive: true);
+
+    // Extract frames to temp
+    onProgress?.call(0.08, 'Extracting frames');
+    final framesDir = await _extractFrames(videoFile);
+    final frameFiles = (await framesDir.list().toList())
+      ..sort((a,b)=>a.path.compareTo(b.path));
+    final pngs = <img.Image>[];
+    for (final e in frameFiles) {
+      if (e is File && e.path.endsWith('.png')) {
+        final im = img.decodePng(await e.readAsBytes());
+        if (im != null) pngs.add(im);
+      }
+    }
+    if (pngs.isEmpty) {
+      throw Exception('No frames decoded from video.');
     }
 
-    final runDir = await _prepareRunDirectory();
-    final framesDir = Directory(p.join(runDir.path, 'frames'));
-    await framesDir.create(recursive: true);
+    final total = pngs.length;
+    onProgress?.call(0.12, 'Running YOLO/RTMPose');
 
-    await _extractFrames(videoFile, framesDir);
+    // Globals
+    final inW = pngs.first.width, inH = pngs.first.height;
 
-    final frameFiles = await framesDir
-        .list()
-        .whereType<File>()
-        .toList()
-      ..sort((a, b) => a.path.compareTo(b.path));
-    if (frameFiles.isEmpty) {
-      throw const PosePipelineException('No frames extracted from video.');
-    }
-
-    final firstImage = img.decodeImage(await frameFiles.first.readAsBytes());
-    if (firstImage == null) {
-      throw PosePipelineException('Unable to decode first frame: ${frameFiles.first.path}');
-    }
-    final frameWidth = firstImage.width.toDouble();
-    final frameHeight = firstImage.height.toDouble();
-
-    final yoloInput = yoloCfg['model']['input'] as Map<String, dynamic>;
-    final yoloOutput = yoloCfg['model']['output'] as Map<String, dynamic>;
-    final yoloPost = yoloCfg['postprocess'] as Map<String, dynamic>;
-
-    final lbHeight = (yoloInput['height'] ?? yoloInput['letterbox']['target_height']) as int;
-    final lbWidth = (yoloInput['width'] ?? yoloInput['letterbox']['target_width']) as int;
-    final padColor = (yoloInput['letterbox']['pad_color'] as List<dynamic>).cast<int>();
-    final confThreshold = (yoloPost['conf_threshold'] as num).toDouble();
-    final iouThreshold = (yoloPost['iou_threshold'] as num).toDouble();
-    final maxDetections = (yoloPost['max_detections'] ?? 300) as int;
-    final classActivation = yoloOutput['class_score_activation'] as String? ?? 'sigmoid';
-    final personClassId = (yoloOutput['classes']['person_id'] as num).toInt();
-    final yoloUnits = (yoloOutput['domain']['units'] as String?) ?? 'normalized';
-    final yoloCoords = (yoloOutput['domain']['coords'] as String?) ?? 'letterbox';
-
-    final rtmOutput = rtmCfg['model']['output'] as Map<String, dynamic>;
-    final rtmInput = rtmCfg['model']['input'] as Map<String, dynamic>;
-    final rtmPreproc = (rtmInput['preprocess'] as Map<String, dynamic>?) ?? const {};
-    final splitRatio = ((rtmOutput['simcc'] as Map<String, dynamic>)['split_ratio'] as num).toDouble();
-    final keypoints = (rtmOutput['keypoints'] as num).toInt();
-
-    final mbInputCfg = motionCfg['model']['input'] as Map<String, dynamic>;
-    final sequenceLength = (mbInputCfg['sequence_length'] as num).toInt();
-    final wrapPad = (motionCfg['runtime'] as Map<String, dynamic>?)?['wrap_pad_sequence'] as bool? ?? false;
-
-    final detectionLog = <Map<String, dynamic>>[];
+    // Accumulators for JSON parity
     final yoloBboxesNorm = <List<double>>[];
     final yoloScores = <double>[];
-    final seqCoco = <List<List<double>>>[];
-    final seqH36m = <List<List<double>>>[];
+    final seqCocoXYC = <List<List<double>>>[];  // [F][17][3]
+    final seqH36MXYC = <List<List<double>>>[];  // [F][17][3]
 
-    List<double>? previousBBox;
+    _prevBox = null;
 
-    for (var index = 0; index < frameFiles.length; index++) {
-      final file = frameFiles[index];
-      final image = index == 0 ? firstImage : img.decodeImage(await file.readAsBytes());
-      if (image == null) {
-        throw PosePipelineException('Unable to decode frame: ${file.path}');
-      }
+    // Loop frames
+    for (int fi = 0; fi < pngs.length; fi++) {
+      final frame = pngs[fi];
 
-      final letterbox = _letterbox(image, targetH: lbHeight, targetW: lbWidth, padColor: padColor);
-      final yoloInputTensor = _imageToFloat32Nchw(letterbox.image, scale: 1 / 255.0);
-      final rawDetections = await _runYolo(yoloInputTensor, [1, 3, lbHeight, lbWidth]);
-      final detection = _decodeYolo(
-        rawDetections,
-        letterboxWidth: lbWidth,
-        letterboxHeight: lbHeight,
-        scale: letterbox.scale,
-        padX: letterbox.padX,
-        padY: letterbox.padY,
-        origWidth: image.width.toDouble(),
-        origHeight: image.height.toDouble(),
-        confThreshold: confThreshold,
-        iouThreshold: iouThreshold,
-        maxDetections: maxDetections,
-        classActivation: classActivation,
-        personClassId: personClassId,
-        outputUnits: yoloUnits,
-        outputCoords: yoloCoords,
-      );
+      // --- YOLO letterbox -> infer -> undo letterbox ---
+      final (lb, ratio, pads) = _letterbox(
+        frame, newH: cfg.yoloInH, newW: cfg.yoloInW, padColor: img.ColorRgb8(114,114,114));
+      final yoloIn = _toCHWFloat(lb, mean: const [0,0,0], std: const [255,255,255], bgr: false);
+      final yoloFeeds = {_yoloInName: await OrtValue.fromList(yoloIn, [1,3,cfg.yoloInH,cfg.yoloInW])};
+      final yoloRes = await _yolo.run(yoloFeeds);
+      final yoloOut = yoloRes[_yoloOutNames.first]!;
+      final yShape = yoloOut.shape; // [1,N,C] or [1,C,N]
+      final yData = (await yoloOut.asFlattenedList()).cast<num>();
+      for (final v in yoloRes.values) { await v.dispose(); }
 
-      List<double> bbox;
-      double score;
-      if (detection != null) {
-        bbox = detection.bbox;
-        score = detection.score;
-        previousBBox = bbox;
-      } else if (previousBBox != null) {
-        bbox = List<double>.from(previousBBox);
-        score = 0.0;
+      final dets = _yoloPostprocess(
+        flat: yData, shape: yShape, imgW: frame.width, imgH: frame.height,
+        ratio: ratio, pads: pads, confTh: cfg.confTh, iouTh: cfg.iouTh,
+        classId: cfg.personClassId, activation: cfg.classScoreActivation);
+
+      // Best or fallback
+      List<double> box;
+      double score = 0.0;
+      if (dets.isEmpty) {
+        if (_prevBox != null) {
+          box = List<double>.from(_prevBox!);
+        } else {
+          box = [inW*0.25, inH*0.1, inW*0.75, inH*0.9];
+        }
       } else {
-        bbox = [
-          image.width * 0.25,
-          image.height * 0.1,
-          image.width * 0.75,
-          image.height * 0.9,
-        ];
-        score = 0.0;
-        previousBBox = bbox;
+        box = dets.first.xyxy;
+        score = dets.first.score;
+        _prevBox = List<double>.from(box);
       }
-
-      final bboxNorm = [
-        bbox[0] / image.width,
-        bbox[1] / image.height,
-        bbox[2] / image.width,
-        bbox[3] / image.height,
-      ];
-      detectionLog.add({
-        't': index,
-        'bbox': bboxNorm,
-        'score': score,
-        'yolo_output_units': yoloUnits,
-        'yolo_output_coords': yoloCoords,
-      });
-      yoloBboxesNorm.add(bboxNorm);
+      // normalized bbox (by original W/H)
+      yoloBboxesNorm.add([box[0]/inW, box[1]/inH, box[2]/inW, box[3]/inH]);
       yoloScores.add(score);
 
-      final crop = _cropToAspect(image, bbox, outH: 256, outW: 192, scale: 1.25);
-      if (crop == null) {
-        if (seqCoco.isNotEmpty) {
-          seqCoco.add(seqCoco.last.map((joint) => List<double>.from(joint)).toList());
-          seqH36m.add(seqH36m.last.map((joint) => List<double>.from(joint)).toList());
+      // --- Crop to 256x192 → RTMPose (SimCC decode) ---
+      final cropRes = _cropToAspect(frame, box, outH: cfg.rtmInH, outW: cfg.rtmInW, scale: 1.25);
+      final crop = cropRes.$1; 
+      final rect = cropRes.$2; // [rx,ry,rw,rh] in original pixels
+
+      if (crop == null || rect == null) {
+        if (seqCocoXYC.isNotEmpty) {
+          seqCocoXYC.add(_deepCopy2D(seqCocoXYC.last));
+          seqH36MXYC.add(_deepCopy2D(seqH36MXYC.last));
         } else {
-          final zeroFrame = List<List<double>>.generate(17, (_) => [0.0, 0.0, 0.0]);
-          seqCoco.add(zeroFrame);
-          seqH36m.add(zeroFrame);
+          seqCocoXYC.add(_zeros173());
+          seqH36MXYC.add(_zeros173());
         }
-        continue;
+      } else {
+        final (mean, std, bgr) = _rtmPreprocTriplet();
+        final rtmInput = _toCHWFloat(crop, mean: mean, std: std, bgr: bgr);
+        final rtmFeeds = {_rtmInName: await OrtValue.fromList(rtmInput, [1,3,cfg.rtmInH,cfg.rtmInW])};
+        final rtmRes = await _rtm.run(rtmFeeds);
+
+        // Expect two outputs: simcc_x [1,K,Lx], simcc_y [1,K,Ly]
+        final simccX = rtmRes[_rtmOutNames[0]]!;
+        final simccY = rtmRes[_rtmOutNames[1]]!;
+        final xShape = simccX.shape; 
+        final yShape2 = simccY.shape;
+        final xFlat = (await simccX.asFlattenedList()).cast<double>();
+        final yFlat = (await simccY.asFlattenedList()).cast<double>();
+        for (final v in rtmRes.values) { await v.dispose(); }
+
+        final cocoCrop = _simccDecode(xFlat, xShape, yFlat, yShape2, splitRatio: cfg.simccRatio); // [17][3] in crop
+
+        // Map crop→image pixels via rect [rx,ry,rw,rh]
+        final rx = rect[0], ry = rect[1], rw = rect[2], rh = rect[3];
+        final cocoXYC = List.generate(17, (i) {
+          final x = rx + cocoCrop[i][0] * (rw / cfg.rtmInW);
+          final y = ry + cocoCrop[i][1] * (rh / cfg.rtmInH);
+          return [x, y, cocoCrop[i][2]];
+        });
+
+        // COCO→H36M mapping
+        final h36mXYC = _coco17ToH36M17(cocoXYC);
+
+        seqCocoXYC.add(cocoXYC);
+        seqH36MXYC.add(h36mXYC);
       }
 
-      final cropTensor = _prepareRtmInput(
-        crop.image,
-        mode: rtmPreproc['mode'] as String? ?? 'rgb_255',
-        mean: (rtmPreproc['mean'] as List<dynamic>?)?.map((e) => (e as num).toDouble()).toList(),
-        std: (rtmPreproc['std'] as List<dynamic>?)?.map((e) => (e as num).toDouble()).toList(),
-      );
-
-      final simcc = await _runRtm(cropTensor, const [1, 3, 256, 192]);
-      final coords = _decodeSimcc(
-        simccX: simcc.simccX,
-        simccY: simcc.simccY,
-        splitRatio: splitRatio,
-        keypoints: keypoints,
-      );
-
-      final cocoFrame = _coordsToImage(coords, crop.rect, cropWidth: 192.0, cropHeight: 256.0);
-      final h36mFrame = _coco17ToH36m17(cocoFrame);
-      seqCoco.add(cocoFrame);
-      seqH36m.add(h36mFrame);
+      // progress window: 12%..90%
+      final p = 0.12 + 0.78 * (fi + 1) / total;
+      onProgress?.call(p, 'Frames ${fi + 1}/$total');
     }
 
-    final mbInput = _prepareMotionInput(
-      seqH36m,
-      frameWidth: frameWidth,
-      frameHeight: frameHeight,
-      sequenceLength: sequenceLength,
-      wrapPad: wrapPad,
-    );
-    final mbOutput = await _runMotionBert(mbInput, sequenceLength: sequenceLength);
+    // --- Build MotionBERT input sequence: H36M XY normalized to [-1,1], conf untouched ---
+    onProgress?.call(0.91, 'Preparing MotionBERT input');
+    final mbSeq = _buildMbSequence(seqH36MXYC, inW, inH, T: cfg.T, wrapPad: cfg.wrapPad);
 
-    final outputs = await _writeOutputs(
-      runDir: runDir,
-      videoFile: videoFile,
-      detections: detectionLog,
-      yoloBboxesNorm: yoloBboxesNorm,
-      yoloScores: yoloScores,
-      yoloUnits: yoloUnits,
-      yoloCoords: yoloCoords,
-      cocoFrames: seqCoco,
-      h36mFrames: seqH36m,
-      mbInput: mbInput,
-      mbOutput: mbOutput,
-    );
-
-    return PoseRunResult(
-      runDirectory: runDir,
-      frameCount: seqCoco.length,
-      outputs: outputs,
-    );
-  }
-
-  Future<Float32List> _runYolo(Float32List input, List<int> shape) async {
-    final tensor = ort.OrtValueTensor.createTensorFloat32(input, shape);
-    final outputs = await yoloSession.runAsync({yoloInputName: tensor});
-    tensor.close();
-    try {
-      final first = outputs.first.value as Float32List;
-      return Float32List.fromList(first.toList());
-    } finally {
-      for (final out in outputs) {
-        out.close();
+    // --- MotionBERT inference ---
+    onProgress?.call(0.94, 'Running MotionBERT');
+    final mbFlat = <double>[];
+    for (int t = 0; t < cfg.T; t++) {
+      for (int j = 0; j < 17; j++) {
+        mbFlat.addAll(mbSeq[t][j]); // [xn, yn, c]
       }
     }
+    final mbFeeds = {_mbInName: await OrtValue.fromList(mbFlat, [1, cfg.T, 17, 3])};
+    final mbRes = await _mb.run(mbFeeds);
+    final mbTensor = mbRes[_mbOutNames.first]!;
+    final mbShape = mbTensor.shape; // [1,T,17,3]
+    final mbData = (await mbTensor.asFlattenedList()).cast<double>();
+    for (final v in mbRes.values) { await v.dispose(); }
+    final coords3d = _reshape3d(mbData, mbShape[1], mbShape[2], mbShape[3]); // [T][17][3]
+    if (cfg.rootRel) {
+      for (int t = 0; t < coords3d.length; t++) {
+        coords3d[t][0] = [0.0,0.0,0.0];
+      }
+    }
+
+    // --- Write JSON artifacts ---
+    onProgress?.call(0.98, 'Writing JSONs');
+    final videoBase = videoFile.uri.pathSegments.last;
+    await _writeJson(outDir.path, 'yolo_out.json', {
+      "video": videoBase,
+      "frames": yoloBboxesNorm.length,
+      "bboxes_norm": yoloBboxesNorm,
+      "scores": yoloScores,
+      "yolo_output_units": "normalized",
+      "yolo_output_coords": cfg.yoloCoords,
+      "normalized_by": ["width","height"]
+    });
+
+    await _writeJson(outDir.path, 'rtm_out.json', {
+      "video": videoBase,
+      "frames": seqCocoXYC.length,
+      "coco_order": cfg.cocoOrder,
+      "coords_2d": seqCocoXYC
+    });
+
+    await _writeJson(outDir.path, 'motionbert_out.json', {
+      "video": videoBase,
+      "T": cfg.T,
+      "h36m_order": cfg.h36mOrder,
+      "coords_3d": coords3d
+    });
+
+    onProgress?.call(1.0, 'Done');
+    return outDir.path;
   }
 
-  Future<_RtmResult> _runRtm(Float32List input, List<int> shape) async {
-    final tensor = ort.OrtValueTensor.createTensorFloat32(input, shape);
-    final outputs = await rtmSession.runAsync({rtmInputName: tensor});
-    tensor.close();
-    try {
-      final simccX = Float32List.fromList((outputs[0].value as Float32List).toList());
-      final simccY = Float32List.fromList((outputs[1].value as Float32List).toList());
-      return _RtmResult(simccX: simccX, simccY: simccY);
-    } finally {
-      for (final out in outputs) {
-        out.close();
+  // ---------- Helpers ----------
+
+  Future<Directory> _extractFrames(File video) async {
+    final tmp = await getTemporaryDirectory();
+    final dir = Directory('${tmp.path}/frames_${_ts()}');
+    await dir.create(recursive: true);
+    final cmd = ['-hide_banner','-y','-i', video.path, '${dir.path}/frame_%05d.png'].join(' ');
+    await FFmpegKit.execute(cmd);
+    return dir;
+  }
+
+  (img.Image, double, List<double>) _letterbox(
+    img.Image src, {required int newH, required int newW, required img.Color padColor}) {
+    final h = src.height, w = src.width;
+    final r = math.min(newW / w, newH / h);
+    final nh = (h * r).round(), nw = (w * r).round();
+
+    final resized = img.copyResize(src, width: nw, height: nh, interpolation: img.Interpolation.linear);
+    final canvas = img.Image(width: newW, height: newH);
+    img.fill(canvas, color: padColor);
+    final dw = ((newW - nw) / 2).floor();
+    final dh = ((newH - nh) / 2).floor();
+    img.compositeImage(canvas, resized, dstX: dw, dstY: dh);
+
+    final pads = [dw.toDouble(), dh.toDouble(), (newW - nw - dw).toDouble(), (newH - nh - dh).toDouble()];
+    return (canvas, r, pads);
+  }
+
+  Float32List _toCHWFloat(img.Image image, {required List<double> mean, required List<double> std, required bool bgr}) {
+    final h = image.height, w = image.width;
+    final out = Float32List(3 * h * w);
+    var dx = 0;
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        final p = image.getPixel(x, y);
+        double r = (p.r as num).toDouble();
+        double g = (p.g as num).toDouble();
+        double b = (p.b as num).toDouble();
+        if (bgr) { final t = r; r = b; b = t; }
+        r = (r - mean[0]) / std[0];
+        g = (g - mean[1]) / std[1];
+        b = (b - mean[2]) / std[2];
+        final idx = dx;
+        out[idx] = r;
+        out[idx + h * w] = g;
+        out[idx + 2 * h * w] = b;
+        dx++;
       }
+    }
+    return out;
+  }
+
+  (img.Image?, List<double>?) _cropToAspect(
+    img.Image src, List<double> boxXYXY, {required int outH, required int outW, double scale = 1.25}) {
+    final w = src.width.toDouble(), h = src.height.toDouble();
+    double x1 = boxXYXY[0], y1 = boxXYXY[1], x2 = boxXYXY[2], y2 = boxXYXY[3];
+    final cx = (x1 + x2) / 2.0, cy = (y1 + y2) / 2.0;
+    double bw = (x2 - x1) * scale, bh = (y2 - y1) * scale;
+
+    final targetAR = outW / outH; // 192/256
+    if (bw / bh > targetAR) bh = bw / targetAR; else bw = bh * targetAR;
+
+    final nx1 = (cx - bw / 2).round().clamp(0, w - 1).toInt();
+    final ny1 = (cy - bh / 2).round().clamp(0, h - 1).toInt();
+    final nx2 = (cx + bw / 2).round().clamp(0, w - 1).toInt();
+    final ny2 = (cy + bh / 2).round().clamp(0, h - 1).toInt();
+    final cw = math.max(1, nx2 - nx1), ch = math.max(1, ny2 - ny1);
+    if (cw <= 1 || ch <= 1) return (null, null);
+
+    final crop = img.copyCrop(src, x: nx1, y: ny1, width: cw, height: ch);
+    final resized = img.copyResize(crop, width: outW, height: outH, interpolation: img.Interpolation.linear);
+    return (resized, [nx1.toDouble(), ny1.toDouble(), cw.toDouble(), ch.toDouble()]);
+  }
+
+  List<YDet> _yoloPostprocess({
+    required List<num> flat,
+    required List<int> shape,
+    required int imgW,
+    required int imgH,
+    required double ratio,
+    required List<double> pads, // [L,T,R,B]
+    required double confTh,
+    required double iouTh,
+    required int classId,
+    required String activation, // 'sigmoid' or 'none'
+  }) {
+    if (shape[0] != 1) { throw ArgumentError('Only batch=1 supported, got $shape'); }
+
+    late final int n; late final int c; late final bool transposed;
+    if (shape[1] > shape[2]) { n = shape[1]; c = shape[2]; transposed = false; }
+    else { c = shape[1]; n = shape[2]; transposed = true; }
+
+    final boxes = List<double>.filled(n*4, 0);
+    final cls   = List<double>.filled(n*(c-4), 0);
+
+    if (!transposed) {
+      for (int i=0;i<n;i++){
+        for (int j=0;j<4;j++){ boxes[i*4+j] = flat[i*c+j].toDouble(); }
+        for (int j=0;j<(c-4);j++){ cls[i*(c-4)+j] = flat[i*c+4+j].toDouble(); }
+      }
+    } else {
+      for (int i=0;i<n;i++){
+        for (int j=0;j<4;j++){ boxes[i*4+j] = flat[j*n+i].toDouble(); }
+        for (int j=0;j<(c-4);j++){ cls[i*(c-4)+j] = flat[(4+j)*n+i].toDouble(); }
+      }
+    }
+
+    if (activation == 'sigmoid') {
+      for (int i=0;i<cls.length;i++){
+        final v = cls[i];
+        cls[i] = 1.0 / (1.0 + math.exp(-v));
+      }
+    }
+
+    final dets = <YDet>[];
+    final padL = pads[0], padT = pads[1];
+
+    for (int i=0;i<n;i++){
+      // best class
+      double bestScore = -1e9; int bestK = -1;
+      for (int k=0;k<(c-4);k++){
+        final v = cls[i*(c-4)+k];
+        if (v > bestScore){ bestScore = v; bestK = k; }
+      }
+      if (bestK != classId) continue;
+      if (bestScore < confTh) continue;
+
+      final cx = boxes[i*4+0], cy = boxes[i*4+1];
+      final bw = boxes[i*4+2], bh = boxes[i*4+3];
+      final x1lb = cx - bw/2, y1lb = cy - bh/2, x2lb = cx + bw/2, y2lb = cy + bh/2;
+
+      // undo letterbox
+      final x1 = _clampD((x1lb - padL) / ratio, 0.0, imgW - 1.0);
+      final y1 = _clampD((y1lb - padT) / ratio, 0.0, imgH - 1.0);
+      final x2 = _clampD((x2lb - padL) / ratio, 0.0, imgW - 1.0);
+      final y2 = _clampD((y2lb - padT) / ratio, 0.0, imgH - 1.0);
+
+      dets.add(YDet([x1,y1,x2,y2], bestScore));
+    }
+
+    // NMS
+    dets.sort((a,b)=>b.score.compareTo(a.score));
+    final keep = <YDet>[];
+    for (final d in dets){
+      bool sup = false;
+      for (final k in keep){
+        if (_iou(d.xyxy, k.xyxy) > iouTh){ sup = true; break; }
+      }
+      if (!sup) keep.add(d);
+    }
+    return keep;
+  }
+
+  List<List<double>> _simccDecode(List<double> x, List<int> xs, List<double> y, List<int> ys, {required double splitRatio}) {
+    // x: [1,K,Lx], y: [1,K,Ly]
+    final K = xs[1], Lx = xs[2], Ly = ys[2];
+    final out = List.generate(K, (_) => [0.0,0.0,0.0]);
+    for (int k=0;k<K;k++){
+      // softmax + argmax for x
+      final xo = k*Lx;
+      double xmax=-1e30; for(int i=0;i<Lx;i++){ if (x[xo+i]>xmax) xmax=x[xo+i]; }
+      double xsum=0.0; for(int i=0;i<Lx;i++){ xsum += math.exp(x[xo+i]-xmax); }
+      int xi=0; double xbest=0.0;
+      for(int i=0;i<Lx;i++){
+        final p = math.exp(x[xo+i]-xmax)/xsum;
+        if (p> xbest){ xbest=p; xi=i; }
+      }
+
+      // softmax + argmax for y
+      final yo = k*Ly;
+      double ymax=-1e30; for(int i=0;i<Ly;i++){ if (y[yo+i]>ymax) ymax=y[yo+i]; }
+      double ysum=0.0; for(int i=0;i<Ly;i++){ ysum += math.exp(y[yo+i]-ymax); }
+      int yi=0; double ybest=0.0;
+      for(int i=0;i<Ly;i++){
+        final p = math.exp(y[yo+i]-ymax)/ysum;
+        if (p> ybest){ ybest=p; yi=i; }
+      }
+      final xx = xi.toDouble()/splitRatio;
+      final yy = yi.toDouble()/splitRatio;
+      out[k][0]=xx; out[k][1]=yy; out[k][2]=math.sqrt(xbest*ybest);
+    }
+    return out;
+  }
+
+  List<List<double>> _coco17ToH36M17(List<List<double>> cocoXYC) {
+    // indices (COCO):
+    // 0 nose,1 leye,2 reye,3 lear,4 rear,5 lsho,6 rsho,7 lelb,8 relb,9 lwri,10 rwri,
+    // 11 lhip,12 rhip,13 lknee,14 rknee,15 lank,16 rank
+    List<double> nose = cocoXYC[0],
+        leye = cocoXYC[1], reye = cocoXYC[2];
+    List<double> lsho = cocoXYC[5], rsho = cocoXYC[6];
+    List<double> lelb = cocoXYC[7], relb = cocoXYC[8];
+    List<double> lwri = cocoXYC[9], rwri = cocoXYC[10];
+    List<double> lhip = cocoXYC[11], rhip = cocoXYC[12];
+    List<double> lknee = cocoXYC[13], rknee = cocoXYC[14];
+    List<double> lank = cocoXYC[15], rank = cocoXYC[16];
+
+    final pelvis = [(lhip[0] + rhip[0])/2.0, (lhip[1] + rhip[1])/2.0, (lhip[2] + rhip[2])/2.0];
+    final neck   = [(lsho[0] + rsho[0])/2.0, (lsho[1] + rsho[1])/2.0, (lsho[2] + rsho[2])/2.0];
+    final spine1 = [(pelvis[0] + neck[0])/2.0, (pelvis[1] + neck[1])/2.0, (pelvis[2] + neck[2])/2.0];
+    final head   = (leye[2]>0 && reye[2]>0)
+        ? [(leye[0] + reye[0])/2.0, (leye[1] + reye[1])/2.0, (leye[2] + reye[2])/2.0]
+        : [nose[0], nose[1], nose[2]];
+    final site = [nose[0], nose[1], nose[2]];
+
+    final h = List.generate(17, (_) => [0.0,0.0,0.0]);
+    h[0]  = pelvis;
+    h[1]  = rhip;  h[2]  = rknee; h[3]  = rank;
+    h[4]  = lhip;  h[5]  = lknee; h[6]  = lank;
+    h[7]  = spine1;h[8]  = neck;  h[9]  = head; h[10] = site;
+    h[11] = lsho;  h[12] = lelb;  h[13] = lwri;
+    h[14] = rsho;  h[15] = relb;  h[16] = rwri;
+    return h;
+  }
+
+  List<List<List<double>>> _buildMbSequence(
+    List<List<List<double>>> seqH36MXYC, int inW, int inH, {required int T, required bool wrapPad}) {
+    final F = seqH36MXYC.length;
+    final seq = <List<List<double>>>[];
+    for (int t=0;t<F;t++){
+      final frame = <List<double>>[];
+      final s = math.min(inW,inH)/2.0;
+      final cx = inW/2.0, cy = inH/2.0;
+      for (int j=0;j<17;j++){
+        final x = seqH36MXYC[t][j][0], y = seqH36MXYC[t][j][1], c = seqH36MXYC[t][j][2];
+        final xn = (x - cx) / s;
+        final yn = (y - cy) / s;
+        frame.add([xn, yn, c]);
+      }
+      seq.add(frame);
+    }
+    if (wrapPad) {
+      if (seq.length < T) {
+        final last = seq.isNotEmpty ? _deepCopy2D(seq.last) : _zeros173();
+        while (seq.length < T) seq.add(_deepCopy2D(last));
+      } else if (seq.length > T) {
+        while (seq.length > T) { seq.removeLast(); }
+      }
+    } else {
+      if (seq.length != T) {
+        throw Exception('MotionBERT expects T=$T, got ${seq.length}. Enable wrapPad in cfg to pad/truncate.');
+      }
+    }
+    return seq;
+  }
+
+  List<List<List<double>>> _reshape3d(List<double> flat, int T, int J, int C){
+    final out = List.generate(T, (_) => List.generate(J, (_)=>List.filled(C,0.0)));
+    int idx=0;
+    for (int t=0;t<T;t++){
+      for (int j=0;j<J;j++){
+        for (int c=0;c<C;c++){
+          out[t][j][c] = flat[idx++];
+        }
+      }
+    }
+    return out;
+  }
+
+  Future<void> _writeJson(String dir, String name, Map<String,Object?> payload) async {
+    final f = File('$dir/$name');
+    await f.writeAsString(const JsonEncoder.withIndent('  ').convert(payload));
+  }
+
+  String _ts(){
+    final n = DateTime.now();
+    String two(int v)=>v.toString().padLeft(2,'0');
+    return '${n.year}${two(n.month)}${two(n.day)}_${two(n.hour)}${two(n.minute)}${two(n.second)}';
+  }
+
+  double _clampD(double v, double lo, double hi) => v < lo ? lo : (v > hi ? hi : v);
+
+  double _iou(List<double> a, List<double> b) {
+    final ax1=a[0], ay1=a[1], ax2=a[2], ay2=a[3];
+    final bx1=b[0], by1=b[1], bx2=b[2], by2=b[3];
+    final interX1 = math.max(ax1, bx1), interY1 = math.max(ay1, by1);
+    final interX2 = math.min(ax2, bx2), interY2 = math.min(ay2, by2);
+    final interW = math.max(0, interX2 - interX1), interH = math.max(0, interY2 - interY1);
+    final inter = interW * interH;
+    final aArea = math.max(0, ax2 - ax1) * math.max(0, ay2 - ay1);
+    final bArea = math.max(0, bx2 - bx1) * math.max(0, by2 - by1);
+    return inter / (aArea + bArea - inter + 1e-6);
+  }
+
+  (List<double>, List<double>, bool) _rtmPreprocTriplet(){
+    switch (cfg.rtmPreproc) {
+      case 'rgb_ms': return (cfg.rtmMean, cfg.rtmStd, false);
+      case 'bgr_ms': return (cfg.rtmMean, cfg.rtmStd, true);
+      case 'bgr_255': return ([0,0,0], [255,255,255], true);
+      case 'rgb_255':
+      default: return ([0,0,0], [255,255,255], false);
     }
   }
 
-  Future<Float32List> _runMotionBert(Float32List input, {required int sequenceLength}) async {
-    final tensor = ort.OrtValueTensor.createTensorFloat32(input, [1, sequenceLength, 17, 3]);
-    final outputs = await motionSession.runAsync({motionInputName: tensor});
-    tensor.close();
-    try {
-      final first = outputs.first.value as Float32List;
-      return Float32List.fromList(first.toList());
-    } finally {
-      for (final out in outputs) {
-        out.close();
-      }
-    }
-  }
+  List<List<double>> _deepCopy2D(List<List<double>> src) =>
+      List<List<double>>.generate(src.length, (i) => List<double>.from(src[i]), growable: false);
+
+  List<List<double>> _zeros173() =>
+      List<List<double>>.generate(17, (_) => [0.0, 0.0, 0.0], growable: false);
 }
 
-class _RtmResult {
-  const _RtmResult({required this.simccX, required this.simccY});
-  final Float32List simccX;
-  final Float32List simccY;
-}
-
-class _LetterboxResult {
-  const _LetterboxResult({
-    required this.image,
-    required this.scale,
-    required this.padX,
-    required this.padY,
-  });
-
-  final img.Image image;
-  final double scale;
-  final double padX;
-  final double padY;
-}
-
-class _CropResult {
-  const _CropResult({required this.image, required this.rect});
-  final img.Image image;
-  final _RectD rect;
-}
-
-class _RectD {
-  const _RectD(this.x, this.y, this.width, this.height);
-
-  final double x;
-  final double y;
-  final double width;
-  final double height;
-}
-
-class _YoloDetection {
-  const _YoloDetection({required this.bbox, required this.score});
-  final List<double> bbox;
+class YDet {
+  YDet(this.xyxy, this.score);
+  final List<double> xyxy;
   final double score;
 }
 
-Future<Directory> _ensureModelCache() async {
-  final docs = await getApplicationDocumentsDirectory();
-  final cacheDir = Directory(p.join(docs.path, '_onnx_cache'));
-  await cacheDir.create(recursive: true);
-  return cacheDir;
+// -------------------------------
+// Public API convenience:
+// -------------------------------
+
+/// Initialize the runner (reads cfgs and creates ORT sessions)
+Future<OutputEquivRunner> createOutputEquivRunner({ProgressCb? onProgress}) async {
+  final r = OutputEquivRunner();
+  await r.initFromAssets(onProgress: onProgress);
+  return r;
 }
 
-Future<File> _materializeModelAsset(String cfgDir, Map<String, dynamic> cfg, Directory cacheDir) async {
-  final model = cfg['model'] as Map<String, dynamic>;
-  final relativePath = model['path'] as String;
-  final assetPath = p.normalize(p.join(cfgDir, relativePath));
-  final resolvedAsset = assetPath.startsWith('assets/') ? assetPath : 'assets/$assetPath';
-  final target = File(p.join(cacheDir.path, p.basename(resolvedAsset)));
-  if (!await target.exists()) {
-    final data = await rootBundle.load(resolvedAsset);
-    await target.writeAsBytes(data.buffer.asUint8List(), flush: true);
-  }
-  return target;
-}
-
-Future<Directory> _prepareRunDirectory() async {
-  final docs = await getApplicationDocumentsDirectory();
-  final timestamp = DateTime.now().millisecondsSinceEpoch;
-  final runDir = Directory(p.join(docs.path, 'run_$timestamp'));
-  await runDir.create(recursive: true);
-  await Directory(p.join(runDir.path, 'debug')).create(recursive: true);
-  return runDir;
-}
-
-Future<void> _extractFrames(File videoFile, Directory framesDir) async {
-  final pattern = p.join(framesDir.path, 'frame_%06d.png');
-  final command = '-i "${videoFile.path}" -vf fps=30 "$pattern"';
-  final session = await FFmpegKit.execute(command);
-  final code = await session.getReturnCode();
-  if (!ReturnCode.isSuccess(code)) {
-    throw PosePipelineException('FFmpeg failed with code ${ReturnCode.getReturnCode(code)}');
-  }
-}
-
-_LetterboxResult _letterbox(
-  img.Image image, {
-  required int targetH,
-  required int targetW,
-  required List<int> padColor,
-}) {
-  final scale = math.min(targetH / image.height, targetW / image.width);
-  final resized = img.copyResize(
-    image,
-    width: (image.width * scale).round(),
-    height: (image.height * scale).round(),
-    interpolation: img.Interpolation.linear,
-  );
-  final canvas = img.Image(width: targetW, height: targetH);
-  final color = padColor.length >= 3 ? padColor : [114, 114, 114];
-  for (var y = 0; y < targetH; y++) {
-    for (var x = 0; x < targetW; x++) {
-      canvas.setPixelRgba(x, y, color[0], color[1], color[2]);
-    }
-  }
-  final dx = ((targetW - resized.width) / 2).floor();
-  final dy = ((targetH - resized.height) / 2).floor();
-  img.copyInto(canvas, resized, dstX: dx, dstY: dy);
-  return _LetterboxResult(
-    image: canvas,
-    scale: scale,
-    padX: dx.toDouble(),
-    padY: dy.toDouble(),
-  );
-}
-
-Float32List _imageToFloat32Nchw(img.Image image, {required double scale}) {
-  final tensor = Float32List(3 * image.height * image.width);
-  var offset = 0;
-  for (var c = 0; c < 3; c++) {
-    for (var y = 0; y < image.height; y++) {
-      for (var x = 0; x < image.width; x++) {
-        final pixel = image.getPixel(x, y);
-        final channelValue = c == 0
-            ? img.getRed(pixel)
-            : c == 1
-                ? img.getGreen(pixel)
-                : img.getBlue(pixel);
-        tensor[offset++] = channelValue * scale;
-      }
-    }
-  }
-  return tensor;
-}
-
-_YoloDetection? _decodeYolo(
-  Float32List raw, {
-  required int letterboxWidth,
-  required int letterboxHeight,
-  required double scale,
-  required double padX,
-  required double padY,
-  required double origWidth,
-  required double origHeight,
-  required double confThreshold,
-  required double iouThreshold,
-  required int maxDetections,
-  required String classActivation,
-  required int personClassId,
-  required String outputUnits,
-  required String outputCoords,
-}) {
-  const stride = 84;
-  if (raw.isEmpty || raw.length % stride != 0) {
-    return null;
-  }
-
-  final boxes = <List<double>>[];
-  final scores = <double>[];
-  final detections = raw.length ~/ stride;
-
-  for (var i = 0; i < detections; i++) {
-    final base = i * stride;
-    final cx = raw[base];
-    final cy = raw[base + 1];
-    final w = raw[base + 2];
-    final h = raw[base + 3];
-
-    double bestScore = 0;
-    var bestClass = -1;
-    for (var c = 0; c < 80; c++) {
-      final logit = raw[base + 4 + c];
-      final prob = classActivation == 'sigmoid' ? 1.0 / (1.0 + math.exp(-logit)) : logit;
-      if (prob > bestScore) {
-        bestScore = prob;
-        bestClass = c;
-      }
-    }
-
-    if (bestClass != personClassId || bestScore < confThreshold) {
-      continue;
-    }
-
-    final x1 = cx - w / 2;
-    final y1 = cy - h / 2;
-    final x2 = cx + w / 2;
-    final y2 = cy + h / 2;
-    boxes.add([x1, y1, x2, y2]);
-    scores.add(bestScore);
-  }
-
-  if (boxes.isEmpty) {
-    return null;
-  }
-
-  final keep = _nms(boxes, scores, iouThreshold, maxDetections: maxDetections);
-  if (keep.isEmpty) {
-    return null;
-  }
-
-  final box = List<double>.from(boxes[keep.first]);
-  if (outputUnits == 'normalized') {
-    box[0] *= letterboxWidth;
-    box[2] *= letterboxWidth;
-    box[1] *= letterboxHeight;
-    box[3] *= letterboxHeight;
-  }
-
-  if (outputCoords != 'original') {
-    box[0] = (box[0] - padX) / scale;
-    box[2] = (box[2] - padX) / scale;
-    box[1] = (box[1] - padY) / scale;
-    box[3] = (box[3] - padY) / scale;
-  }
-
-  box[0] = box[0].clamp(0, origWidth - 1);
-  box[1] = box[1].clamp(0, origHeight - 1);
-  box[2] = box[2].clamp(0, origWidth - 1);
-  box[3] = box[3].clamp(0, origHeight - 1);
-
-  return _YoloDetection(bbox: box, score: scores[keep.first]);
-}
-
-List<int> _nms(List<List<double>> boxes, List<double> scores, double iouThreshold, {required int maxDetections}) {
-  final indices = List<int>.generate(boxes.length, (i) => i)
-    ..sort((a, b) => scores[b].compareTo(scores[a]));
-  final keep = <int>[];
-
-  while (indices.isNotEmpty && keep.length < maxDetections) {
-    final current = indices.removeAt(0);
-    keep.add(current);
-    indices.removeWhere((idx) => _iou(boxes[current], boxes[idx]) > iouThreshold);
-  }
-  return keep;
-}
-
-double _iou(List<double> a, List<double> b) {
-  final x1 = math.max(a[0], b[0]);
-  final y1 = math.max(a[1], b[1]);
-  final x2 = math.min(a[2], b[2]);
-  final y2 = math.min(a[3], b[3]);
-  final interW = math.max(0, x2 - x1);
-  final interH = math.max(0, y2 - y1);
-  final inter = interW * interH;
-  final areaA = math.max(0, a[2] - a[0]) * math.max(0, a[3] - a[1]);
-  final areaB = math.max(0, b[2] - b[0]) * math.max(0, b[3] - b[1]);
-  final union = areaA + areaB - inter;
-  return union <= 0 ? 0 : inter / union;
-}
-
-_CropResult? _cropToAspect(img.Image image, List<double> bbox, {required int outH, required int outW, required double scale}) {
-  final x1 = bbox[0];
-  final y1 = bbox[1];
-  final x2 = bbox[2];
-  final y2 = bbox[3];
-
-  final cx = (x1 + x2) / 2;
-  final cy = (y1 + y2) / 2;
-  var bw = (x2 - x1) * scale;
-  var bh = (y2 - y1) * scale;
-
-  final targetAr = outW / outH;
-  if (bw / bh > targetAr) {
-    bh = bw / targetAr;
-  } else {
-    bw = bh * targetAr;
-  }
-
-  final x1n = math.max(0, (cx - bw / 2).round());
-  final y1n = math.max(0, (cy - bh / 2).round());
-  final x2n = math.min(image.width - 1, (cx + bw / 2).round());
-  final y2n = math.min(image.height - 1, (cy + bh / 2).round());
-  final width = x2n - x1n;
-  final height = y2n - y1n;
-  if (width <= 0 || height <= 0) {
-    return null;
-  }
-
-  final crop = img.copyCrop(image, x: x1n, y: y1n, width: width, height: height);
-  final resized = img.copyResize(crop, width: outW, height: outH, interpolation: img.Interpolation.linear);
-  return _CropResult(
-    image: resized,
-    rect: _RectD(x1n.toDouble(), y1n.toDouble(), width.toDouble(), height.toDouble()),
-  );
-}
-
-Float32List _prepareRtmInput(img.Image crop, {required String mode, List<double>? mean, List<double>? std}) {
-  final tensor = Float32List(3 * crop.height * crop.width);
-  final normalizedMode = mode.toLowerCase();
-  final meanVals = mean ?? const [123.675, 116.28, 103.53];
-  final stdVals = std ?? const [58.395, 57.12, 57.375];
-  var offset = 0;
-
-  for (var c = 0; c < 3; c++) {
-    for (var y = 0; y < crop.height; y++) {
-      for (var x = 0; x < crop.width; x++) {
-        final pixel = crop.getPixel(x, y);
-        final r = img.getRed(pixel).toDouble();
-        final g = img.getGreen(pixel).toDouble();
-        final b = img.getBlue(pixel).toDouble();
-        double value;
-        if (normalizedMode.startsWith('rgb')) {
-          value = c == 0 ? r : c == 1 ? g : b;
-        } else {
-          value = c == 0 ? b : c == 1 ? g : r;
-        }
-        if (normalizedMode.endsWith('_255')) {
-          value /= 255.0;
-        } else {
-          value = (value - meanVals[c]) / stdVals[c];
-        }
-        tensor[offset++] = value;
-      }
-    }
-  }
-  return tensor;
-}
-
-List<List<double>> _decodeSimcc({
-  required Float32List simccX,
-  required Float32List simccY,
-  required double splitRatio,
-  required int keypoints,
-}) {
-  final xLabel = simccX.length ~/ keypoints;
-  final yLabel = simccY.length ~/ keypoints;
-  final coords = <List<double>>[];
-
-  for (var k = 0; k < keypoints; k++) {
-    final px = _softmaxSegment(simccX, k * xLabel, xLabel);
-    final py = _softmaxSegment(simccY, k * yLabel, yLabel);
-    final xIdx = _argmax(px);
-    final yIdx = _argmax(py);
-    final confidence = math.sqrt(px[xIdx] * py[yIdx]);
-    coords.add([xIdx / splitRatio, yIdx / splitRatio, confidence]);
-  }
-  return coords;
-}
-
-List<double> _softmaxSegment(Float32List data, int start, int length) {
-  var maxVal = -double.infinity;
-  for (var i = 0; i < length; i++) {
-    final v = data[start + i];
-    if (v > maxVal) {
-      maxVal = v;
-    }
-  }
-  final exps = List<double>.generate(length, (i) => math.exp(data[start + i] - maxVal));
-  final sum = exps.fold<double>(0, (acc, v) => acc + v);
-  return exps.map((v) => v / sum).toList(growable: false);
-}
-
-int _argmax(List<double> values) {
-  var bestIndex = 0;
-  var bestValue = values[0];
-  for (var i = 1; i < values.length; i++) {
-    if (values[i] > bestValue) {
-      bestValue = values[i];
-      bestIndex = i;
-    }
-  }
-  return bestIndex;
-}
-
-List<List<double>> _coordsToImage(List<List<double>> coords, _RectD rect, {required double cropWidth, required double cropHeight}) {
-  final scaleX = rect.width / cropWidth;
-  final scaleY = rect.height / cropHeight;
-  return coords
-      .map((c) => [rect.x + c[0] * scaleX, rect.y + c[1] * scaleY, c[2]])
-      .toList(growable: false);
-}
-
-List<List<double>> _coco17ToH36m17(List<List<double>> coco) {
-  List<double> avg(List<double> a, List<double> b) => [
-        (a[0] + b[0]) / 2,
-        (a[1] + b[1]) / 2,
-        (a[2] + b[2]) / 2,
-      ];
-
-  final pelvis = avg(coco[11], coco[12]);
-  final neck = avg(coco[5], coco[6]);
-  final spine1 = avg(pelvis, neck);
-  final eyesMid = (coco[1][2] > 0 && coco[2][2] > 0) ? avg(coco[1], coco[2]) : coco[0];
-  final head = eyesMid;
-  final site = coco[0];
-
-  List<double> clone(int idx) => List<double>.from(coco[idx]);
-
-  final h36m = <List<double>>[
-    [pelvis[0], pelvis[1], (coco[11][2] + coco[12][2]) / 2],
-    clone(12),
-    clone(14),
-    clone(16),
-    clone(11),
-    clone(13),
-    clone(15),
-    [spine1[0], spine1[1], (pelvis[2] + neck[2]) / 2],
-    [neck[0], neck[1], (coco[5][2] + coco[6][2]) / 2],
-    [head[0], head[1], (coco[1][2] > 0 && coco[2][2] > 0) ? (coco[1][2] + coco[2][2]) / 2 : coco[0][2]],
-    clone(0),
-    clone(5),
-    clone(7),
-    clone(9),
-    clone(6),
-    clone(8),
-    clone(10),
-  ];
-  return h36m;
-}
-
-Float32List _prepareMotionInput(
-  List<List<List<double>>> seqH36m, {
-  required double frameWidth,
-  required double frameHeight,
-  required int sequenceLength,
-  required bool wrapPad,
-}) {
-  final sequence = seqH36m.map((frame) => frame.map((joint) => List<double>.from(joint)).toList()).toList();
-  if (wrapPad) {
-    if (sequence.length < sequenceLength) {
-      final last = sequence.isNotEmpty
-          ? sequence.last
-          : List<List<double>>.generate(17, (_) => [0.0, 0.0, 0.0]);
-      while (sequence.length < sequenceLength) {
-        sequence.add(last.map((joint) => List<double>.from(joint)).toList());
-      }
-    } else if (sequence.length > sequenceLength) {
-      sequence.removeRange(sequenceLength, sequence.length);
-    }
-  } else if (sequence.length != sequenceLength) {
-    throw PosePipelineException('MotionBERT expects $sequenceLength frames, got ${sequence.length}');
-  }
-
-  final Float32List tensor = Float32List(sequenceLength * 17 * 3);
-  final s = math.min(frameWidth, frameHeight) / 2.0;
-  final cx = frameWidth / 2.0;
-  final cy = frameHeight / 2.0;
-  var offset = 0;
-
-  for (var t = 0; t < sequenceLength; t++) {
-    final frame = t < sequence.length ? sequence[t] : sequence.last;
-    for (final joint in frame) {
-      final xNorm = s == 0 ? 0.0 : (joint[0] - cx) / s;
-      final yNorm = s == 0 ? 0.0 : (joint[1] - cy) / s;
-      tensor[offset++] = xNorm;
-      tensor[offset++] = yNorm;
-      tensor[offset++] = joint[2];
-    }
-  }
-  return tensor;
-}
-
-Future<Map<String, File>> _writeOutputs({
-  required Directory runDir,
-  required File videoFile,
-  required List<Map<String, dynamic>> detections,
-  required List<List<double>> yoloBboxesNorm,
-  required List<double> yoloScores,
-  required String yoloUnits,
-  required String yoloCoords,
-  required List<List<List<double>>> cocoFrames,
-  required List<List<List<double>>> h36mFrames,
-  required Float32List mbInput,
-  required Float32List mbOutput,
-}) async {
-  final outputs = <String, File>{};
-  final debugDir = Directory(p.join(runDir.path, 'debug'));
-  await debugDir.create(recursive: true);
-
-  final detectionsFile = File(p.join(debugDir.path, 'detections.jsonl'));
-  final sink = detectionsFile.openWrite();
-  for (final det in detections) {
-    sink.writeln(jsonEncode(det));
-  }
-  await sink.close();
-  outputs['detections.jsonl'] = detectionsFile;
-
-  final cocoArray = _flattenFrameArray(cocoFrames);
-  final h36mArray = _flattenFrameArray(h36mFrames);
-  final mbInFrames = mbInput.length ~/ (17 * 3);
-  final mbOutFrames = mbOutput.length ~/ (17 * 3);
-
-  await _writeNpy(debugDir, 'coco_2d.npy', cocoArray, [cocoFrames.length, 17, 3], outputs);
-  await _writeNpy(debugDir, 'h36m_2d.npy', h36mArray, [h36mFrames.length, 17, 3], outputs);
-  await _writeNpy(debugDir, 'mb_input_seq.npy', mbInput, [mbInFrames, 17, 3], outputs);
-  await _writeNpy(debugDir, 'mb_output_3d.npy', mbOutput, [mbOutFrames, 17, 3], outputs);
-
-  final statsFile = File(p.join(debugDir.path, 'quick_stats.json'));
-  final stats = {
-    'frames': cocoFrames.length,
-    'coco_conf_mean': cocoFrames.isEmpty
-        ? 0.0
-        : cocoFrames
-                .expand((frame) => frame.map((joint) => joint[2]))
-                .fold<double>(0, (acc, v) => acc + v) /
-            (cocoFrames.length * 17),
-    'coco_x_ptp': _ptp(cocoFrames, axis: 0),
-    'coco_y_ptp': _ptp(cocoFrames, axis: 1),
-    'seen_person': yoloScores.any((score) => score > 0),
-  };
-  await statsFile.writeAsString(jsonEncode(stats), flush: true);
-  outputs['quick_stats.json'] = statsFile;
-
-  final mbFrames = _float32ToFrames(mbOutput, mbOutFrames);
-  final result = {
-    'video': p.basename(videoFile.path),
-    'T': mbOutFrames,
-    'h36m_order': const [
-      'Pelvis',
-      'RHip',
-      'RKnee',
-      'RAnkle',
-      'LHip',
-      'LKnee',
-      'LAnkle',
-      'Spine1',
-      'Neck',
-      'Head',
-      'Site',
-      'LShoulder',
-      'LElbow',
-      'LWrist',
-      'RShoulder',
-      'RElbow',
-      'RWrist',
-    ],
-    'coords_3d': mbFrames,
-  };
-
-  final out3dFile = File(p.join(runDir.path, 'out_3d.json'));
-  await out3dFile.writeAsString(jsonEncode(result));
-  outputs['out_3d.json'] = out3dFile;
-
-  final rtmPayload = {
-    'video': p.basename(videoFile.path),
-    'frames': cocoFrames.length,
-    'coco_order': const [
-      'Nose',
-      'LEye',
-      'REye',
-      'LEar',
-      'REar',
-      'LShoulder',
-      'RShoulder',
-      'LElbow',
-      'RElbow',
-      'LWrist',
-      'RWrist',
-      'LHip',
-      'RHip',
-      'LKnee',
-      'RKnee',
-      'LAnkle',
-      'RAnkle',
-    ],
-    'coords_2d': cocoFrames,
-  };
-  final rtmFile = File(p.join(runDir.path, 'rtm_out.json'));
-  await rtmFile.writeAsString(jsonEncode(rtmPayload));
-  outputs['rtm_out.json'] = rtmFile;
-
-  final yoloPayload = {
-    'video': p.basename(videoFile.path),
-    'frames': yoloBboxesNorm.length,
-    'bboxes_norm': yoloBboxesNorm,
-    'scores': yoloScores,
-    'yolo_output_units': yoloUnits,
-    'yolo_output_coords': yoloCoords,
-    'normalized_by': const ['width', 'height'],
-  };
-  final yoloFile = File(p.join(runDir.path, 'yolo_out.json'));
-  await yoloFile.writeAsString(jsonEncode(yoloPayload));
-  outputs['yolo_out.json'] = yoloFile;
-
-  final motionbertFile = File(p.join(runDir.path, 'motionbert_out.json'));
-  await motionbertFile.writeAsString(jsonEncode(result));
-  outputs['motionbert_out.json'] = motionbertFile;
-
-  return outputs;
-}
-
-Future<void> _writeNpy(Directory dir, String name, Float32List data, List<int> shape, Map<String, File> outputs) async {
-  final file = File(p.join(dir.path, name));
-  final bytes = _createNpy(data, shape);
-  await file.writeAsBytes(bytes, flush: true);
-  outputs[name] = file;
-}
-
-Float32List _flattenFrameArray(List<List<List<double>>> frames) {
-  final flat = Float32List(frames.length * 17 * 3);
-  var offset = 0;
-  for (final frame in frames) {
-    for (final joint in frame) {
-      flat[offset++] = joint[0];
-      flat[offset++] = joint[1];
-      flat[offset++] = joint[2];
-    }
-  }
-  return flat;
-}
-
-List<List<List<double>>> _float32ToFrames(Float32List data, int frameCount) {
-  final frames = <List<List<double>>>[];
-  var offset = 0;
-  for (var t = 0; t < frameCount; t++) {
-    final joints = <List<double>>[];
-    for (var j = 0; j < 17; j++) {
-      joints.add([
-        data[offset++],
-        data[offset++],
-        data[offset++],
-      ]);
-    }
-    frames.add(joints);
-  }
-  return frames;
-}
-
-double _ptp(List<List<List<double>>> frames, {required int axis}) {
-  if (frames.isEmpty) {
-    return 0.0;
-  }
-  double minVal = double.infinity;
-  double maxVal = -double.infinity;
-  for (final frame in frames) {
-    for (final joint in frame) {
-      final value = joint[axis];
-      if (value < minVal) {
-        minVal = value;
-      }
-      if (value > maxVal) {
-        maxVal = value;
-      }
-    }
-  }
-  return maxVal - minVal;
-}
-
-Uint8List _createNpy(Float32List data, List<int> shape) {
-  final magic = <int>[0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59];
-  final version = <int>[1, 0];
-  final shapeStr = shape.length == 1 ? '(${shape.first},)' : '(${shape.join(', ')})';
-  final headerStr = "{'descr': '<f4', 'fortran_order': False, 'shape': $shapeStr, }";
-  final headerBytes = utf8.encode(headerStr);
-  final headerPadding = 16 - ((magic.length + version.length + 2 + headerBytes.length) % 16);
-  final paddedHeader = headerStr + ' ' * (headerPadding - 1) + '\n';
-  final headerLen = paddedHeader.length;
-  final headerLenBytes = Uint8List(2)..buffer.asByteData().setUint16(0, headerLen, Endian.little);
-  final builder = BytesBuilder()
-    ..add(magic)
-    ..add(version)
-    ..add(headerLenBytes)
-    ..add(utf8.encode(paddedHeader))
-    ..add(data.buffer.asUint8List());
-  return builder.toBytes();
+/// One-shot convenience.
+Future<String> runPipelineOnVideo(File videoFile, {ProgressCb? onProgress}) async {
+  final r = await createOutputEquivRunner(onProgress: onProgress);
+  return r.runOnVideo(videoFile, onProgress: onProgress);
 }
