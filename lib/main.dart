@@ -1,122 +1,207 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:share_plus/share_plus.dart';
+
+import 'run_rgb_to_motionbert3d.dart';
 
 void main() {
-  runApp(const MyApp());
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const PoseApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class PoseApp extends StatelessWidget {
+  const PoseApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'MotionBERT Pipeline',
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const PoseHomePage(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class PoseHomePage extends StatefulWidget {
+  const PoseHomePage({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<PoseHomePage> createState() => _PoseHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _PoseHomePageState extends State<PoseHomePage> {
+  PosePipeline? _pipeline;
+  PoseRunResult? _lastResult;
+  bool _initializing = true;
+  bool _running = false;
+  String _status = 'Preparing models...';
+  String? _error;
 
-  void _incrementCounter() {
+  @override
+  void initState() {
+    super.initState();
+    _initialisePipeline();
+  }
+
+  Future<void> _initialisePipeline() async {
+    try {
+      final pipeline = await PosePipeline.create();
+      if (!mounted) return;
+      setState(() {
+        _pipeline = pipeline;
+        _status = 'Ready';
+        _initializing = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _initializing = false;
+        _error = e.toString();
+        _status = 'Failed to initialise';
+      });
+    }
+  }
+
+  Future<void> _pickAndProcess() async {
+    final pipeline = _pipeline;
+    if (pipeline == null || _running) {
+      return;
+    }
+
+    final picker = ImagePicker();
+    final picked = await picker.pickVideo(source: ImageSource.gallery);
+    if (picked == null) {
+      return;
+    }
+
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _running = true;
+      _status = 'Processing ${picked.name}...';
+      _error = null;
     });
+
+    try {
+      final result = await pipeline.processVideo(File(picked.path));
+      if (!mounted) return;
+      setState(() {
+        _lastResult = result;
+        _status = 'Completed (${result.frameCount} frames)';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _status = 'Processing failed';
+      });
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _running = false;
+      });
+    }
+  }
+
+  Future<void> _shareResults() async {
+    final result = _lastResult;
+    if (result == null) {
+      return;
+    }
+
+    final files = await result.runDirectory
+        .list(recursive: true)
+        .whereType<File>()
+        .toList();
+    if (files.isEmpty) {
+      return;
+    }
+
+    final xfiles = files.map((file) => XFile(file.path)).toList();
+    await Share.shareXFiles(
+      xfiles,
+      text: 'MotionBERT pipeline outputs for ${result.frameCount} frames.',
+      subject: 'MotionBERT Pose Results',
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('RGB → MotionBERT Pipeline'),
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+      body: _initializing
+          ? const Center(child: CircularProgressIndicator())
+          : Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text('Status: $_status'),
+                  if (_error != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      _error!,
+                      style: const TextStyle(color: Colors.redAccent),
+                    ),
+                  ],
+                  const SizedBox(height: 16),
+                  ElevatedButton.icon(
+                    onPressed: (_pipeline == null || _running) ? null : _pickAndProcess,
+                    icon: const Icon(Icons.video_library),
+                    label: const Text('Select video from gallery'),
+                  ),
+                  if (_running) ...[
+                    const SizedBox(height: 12),
+                    const LinearProgressIndicator(),
+                  ],
+                  const SizedBox(height: 16),
+                  if (_lastResult != null)
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Text(
+                            'Run folder: ${_lastResult!.runDirectory.path}',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          const SizedBox(height: 12),
+                          Text('Generated files', style: Theme.of(context).textTheme.titleMedium),
+                          const SizedBox(height: 8),
+                          Expanded(
+                            child: Card(
+                              child: ListView(
+                                children: _lastResult!.outputs.entries
+                                    .toList()
+                                    ..sort((a, b) => a.key.compareTo(b.key))
+                                    .map(
+                                      (entry) => ListTile(
+                                        dense: true,
+                                        title: Text(entry.key),
+                                        subtitle: Text(entry.value.path),
+                                        leading: const Icon(Icons.insert_drive_file),
+                                      ),
+                                    )
+                                    .toList(),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          ElevatedButton.icon(
+                            onPressed: _running ? null : _shareResults,
+                            icon: const Icon(Icons.ios_share),
+                            label: const Text('Share results'),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
             ),
-          ],
-        ),
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
     );
   }
 }
