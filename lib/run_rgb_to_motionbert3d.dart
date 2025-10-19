@@ -9,18 +9,24 @@
 // iOS tip: if you’re on iOS 18+, prefer --profile / --release for now due to a
 // temporary debug-mode issue in Flutter (see Flutter issue tracker).
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:io' show Platform;
 
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
+
+// ffmpeg-kit (+ ffprobe for duration) with async completion & progress callbacks.
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 
 typedef ProgressCb = void Function(double progress, String stage);
+typedef LogCb = void Function(String line);
 
 class _Cfg {
   // YOLO
@@ -91,7 +97,7 @@ class OutputEquivRunner {
     } catch (_) {/* keep defaults */}
 
     // YOLO cfg
-    cfg.yoloModelAsset = (yoloCfg['model']?['path'] ?? 'assets/models/yolo.onnx') as String;
+    cfg.yoloModelAsset = (yoloCfg['model']?['path'] ?? 'assets/models/yolov8n.onnx') as String;
     final yIn = (yoloCfg['model']?['input'] ?? {}) as Map;
     cfg.yoloInH = (yIn['target_height'] ?? yIn['height'] ?? 640) as int;
     cfg.yoloInW = (yIn['target_width']  ?? yIn['width']  ?? 640) as int;
@@ -106,7 +112,7 @@ class OutputEquivRunner {
     cfg.iouTh  = (yPost['iou_threshold']  ?? 0.45).toDouble();
 
     // RTM cfg
-    cfg.rtmModelAsset = (rtmCfg['model']?['path'] ?? 'assets/models/rtmpose.onnx') as String;
+    cfg.rtmModelAsset = (rtmCfg['model']?['path'] ?? 'assets/models/rtmpose-m_256x192.onnx') as String;
     final rIn = (rtmCfg['model']?['input'] ?? {}) as Map;
     cfg.rtmInH = (rIn['target_height'] ?? rIn['height'] ?? 256) as int;
     cfg.rtmInW = (rIn['target_width']  ?? rIn['width']  ?? 192) as int;
@@ -123,7 +129,7 @@ class OutputEquivRunner {
     cfg.simccRatio = ((rOut['simcc'] ?? {}) as Map)['split_ratio']?.toDouble() ?? 2.0;
 
     // MB cfg
-    cfg.mbModelAsset = (mbCfg['model']?['path'] ?? 'assets/models/motionbert.onnx') as String;
+    cfg.mbModelAsset = (mbCfg['model']?['path'] ?? 'assets/models/motionbert_3d_243.onnx') as String;
     cfg.T = (mbCfg['model']?['input']?['sequence_length'] ?? 243) as int;
     cfg.rootRel = (mbCfg['model']?['output']?['root_relative'] ?? false) as bool;
     cfg.wrapPad = (mbCfg['runtime']?['wrap_pad_sequence'] ?? true) as bool;
@@ -131,7 +137,15 @@ class OutputEquivRunner {
     // Create sessions
     onProgress?.call(0.06, 'Creating ONNX sessions');
     _ort = OnnxRuntime();
-    final opts = OrtSessionOptions(providers: const [OrtProvider.XNNPACK]);
+
+    // Keep it broadly compatible; XNNPACK for speed on most targets.
+    // (Swap to COREML on iOS if your flutter_onnxruntime build exposes it.)
+    final providers = Platform.isIOS
+        ? const [OrtProvider.CPU]
+        : const [OrtProvider.XNNPACK, OrtProvider.CPU];
+
+    final opts = OrtSessionOptions(providers: providers);
+
     _yolo = await _ort.createSessionFromAsset(cfg.yoloModelAsset, options: opts);
     _rtm  = await _ort.createSessionFromAsset(cfg.rtmModelAsset,  options: opts);
     _mb   = await _ort.createSessionFromAsset(cfg.mbModelAsset,   options: opts);
@@ -145,32 +159,41 @@ class OutputEquivRunner {
   }
 
   /// Runs the full pipeline on a video file path. Returns output folder path.
-  Future<String> runOnVideo(File videoFile, {ProgressCb? onProgress}) async {
+  Future<String> runOnVideo(File videoFile, {ProgressCb? onProgress, LogCb? onLog}) async {
     final docs = await getApplicationDocumentsDirectory();
     final outDir = Directory('${docs.path}/run_${_ts()}');
     await outDir.create(recursive: true);
 
-    // Extract frames to temp
+    // Extract frames to temp (with real completion + progress).
     onProgress?.call(0.08, 'Extracting frames');
-    final framesDir = await _extractFrames(videoFile);
-    final frameFiles = (await framesDir.list().toList())
-      ..sort((a,b)=>a.path.compareTo(b.path));
-    final pngs = <img.Image>[];
-    for (final e in frameFiles) {
-      if (e is File && e.path.endsWith('.png')) {
-        final im = img.decodePng(await e.readAsBytes());
-        if (im != null) pngs.add(im);
-      }
-    }
-    if (pngs.isEmpty) {
+    final framesDir = await _extractFrames(
+      videoFile,
+      onProgress: (p) {
+        // map ffmpeg 0..1 to 8%..12% so bars move early
+        onProgress?.call(0.08 + 0.04 * p, 'Extracting frames');
+      },
+      onLog: onLog,
+    );
+
+    // List & sort only .png files (streaming — do NOT keep all in RAM)
+    final entries = await framesDir
+        .list()
+        .where((e) => e is File && e.path.endsWith('.png'))
+        .cast<File>()
+        .toList();
+    entries.sort((a, b) => a.path.compareTo(b.path));
+
+    if (entries.isEmpty) {
       throw Exception('No frames decoded from video.');
     }
 
-    final total = pngs.length;
-    onProgress?.call(0.12, 'Running YOLO/RTMPose');
+    // Peek first frame to know input size
+    final firstIm = img.decodePng(await entries.first.readAsBytes());
+    if (firstIm == null) throw Exception('Failed to decode first frame.');
+    final inW = firstIm.width, inH = firstIm.height;
 
-    // Globals
-    final inW = pngs.first.width, inH = pngs.first.height;
+    final total = entries.length;
+    onProgress?.call(0.12, 'Running YOLO/RTMPose');
 
     // Accumulators for JSON parity
     final yoloBboxesNorm = <List<double>>[];
@@ -180,16 +203,21 @@ class OutputEquivRunner {
 
     _prevBox = null;
 
-    // Loop frames
-    for (int fi = 0; fi < pngs.length; fi++) {
-      final frame = pngs[fi];
+    // Process frames one-by-one
+    for (int fi = 0; fi < total; fi++) {
+      final frameBytes = await entries[fi].readAsBytes();
+      final frame = img.decodePng(frameBytes);
+      if (frame == null) continue;
 
       // --- YOLO letterbox -> infer -> undo letterbox ---
       final (lb, ratio, pads) = _letterbox(
         frame, newH: cfg.yoloInH, newW: cfg.yoloInW, padColor: img.ColorRgb8(114,114,114));
-      final yoloIn = _toCHWFloat(lb, mean: const [0,0,0], std: const [255,255,255], bgr: false);
-      final yoloFeeds = {_yoloInName: await OrtValue.fromList(yoloIn, [1,3,cfg.yoloInH,cfg.yoloInW])};
-      final yoloRes = await _yolo.run(yoloFeeds);
+
+      final yoloInFloats = _toCHWFloat(lb, mean: const [0,0,0], std: const [255,255,255], bgr: false);
+      final yoloInVal = await OrtValue.fromList(yoloInFloats, [1,3,cfg.yoloInH,cfg.yoloInW]);
+      final yoloRes = await _yolo.run({_yoloInName: yoloInVal});
+      await yoloInVal.dispose(); // IMPORTANT: free native input buffer
+
       final yoloOut = yoloRes[_yoloOutNames.first]!;
       final yShape = yoloOut.shape; // [1,N,C] or [1,C,N]
       final yData = (await yoloOut.asFlattenedList()).cast<num>();
@@ -204,11 +232,9 @@ class OutputEquivRunner {
       List<double> box;
       double score = 0.0;
       if (dets.isEmpty) {
-        if (_prevBox != null) {
-          box = List<double>.from(_prevBox!);
-        } else {
-          box = [inW*0.25, inH*0.1, inW*0.75, inH*0.9];
-        }
+        box = _prevBox != null
+            ? List<double>.from(_prevBox!)
+            : [inW*0.25, inH*0.1, inW*0.75, inH*0.9];
       } else {
         box = dets.first.xyxy;
         score = dets.first.score;
@@ -220,7 +246,7 @@ class OutputEquivRunner {
 
       // --- Crop to 256x192 → RTMPose (SimCC decode) ---
       final cropRes = _cropToAspect(frame, box, outH: cfg.rtmInH, outW: cfg.rtmInW, scale: 1.25);
-      final crop = cropRes.$1; 
+      final crop = cropRes.$1;
       final rect = cropRes.$2; // [rx,ry,rw,rh] in original pixels
 
       if (crop == null || rect == null) {
@@ -233,14 +259,15 @@ class OutputEquivRunner {
         }
       } else {
         final (mean, std, bgr) = _rtmPreprocTriplet();
-        final rtmInput = _toCHWFloat(crop, mean: mean, std: std, bgr: bgr);
-        final rtmFeeds = {_rtmInName: await OrtValue.fromList(rtmInput, [1,3,cfg.rtmInH,cfg.rtmInW])};
-        final rtmRes = await _rtm.run(rtmFeeds);
+        final rtmInFloats = _toCHWFloat(crop, mean: mean, std: std, bgr: bgr);
+        final rtmInVal = await OrtValue.fromList(rtmInFloats, [1,3,cfg.rtmInH,cfg.rtmInW]);
+        final rtmRes = await _rtm.run({_rtmInName: rtmInVal});
+        await rtmInVal.dispose(); // IMPORTANT
 
         // Expect two outputs: simcc_x [1,K,Lx], simcc_y [1,K,Ly]
         final simccX = rtmRes[_rtmOutNames[0]]!;
         final simccY = rtmRes[_rtmOutNames[1]]!;
-        final xShape = simccX.shape; 
+        final xShape = simccX.shape;
         final yShape2 = simccY.shape;
         final xFlat = (await simccX.asFlattenedList()).cast<double>();
         final yFlat = (await simccY.asFlattenedList()).cast<double>();
@@ -266,6 +293,11 @@ class OutputEquivRunner {
       // progress window: 12%..90%
       final p = 0.12 + 0.78 * (fi + 1) / total;
       onProgress?.call(p, 'Frames ${fi + 1}/$total');
+
+      // Keep UI responsive
+      if ((fi & 3) == 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
     }
 
     // --- Build MotionBERT input sequence: H36M XY normalized to [-1,1], conf untouched ---
@@ -280,8 +312,10 @@ class OutputEquivRunner {
         mbFlat.addAll(mbSeq[t][j]); // [xn, yn, c]
       }
     }
-    final mbFeeds = {_mbInName: await OrtValue.fromList(mbFlat, [1, cfg.T, 17, 3])};
-    final mbRes = await _mb.run(mbFeeds);
+    final mbInVal = await OrtValue.fromList(mbFlat, [1, cfg.T, 17, 3]);
+    final mbRes = await _mb.run({_mbInName: mbInVal});
+    await mbInVal.dispose(); // IMPORTANT
+
     final mbTensor = mbRes[_mbOutNames.first]!;
     final mbShape = mbTensor.shape; // [1,T,17,3]
     final mbData = (await mbTensor.asFlattenedList()).cast<double>();
@@ -326,12 +360,84 @@ class OutputEquivRunner {
 
   // ---------- Helpers ----------
 
-  Future<Directory> _extractFrames(File video) async {
+  /// Robust ffmpeg runner that resolves when the command finishes.
+  Future<void> _runFfmpegAndWait(
+    String command, {
+    LogCb? onLog,
+    void Function(double p)? onProgress,
+    int? totalMs,
+  }) async {
+    final completer = Completer<void>();
+
+    await FFmpegKit.executeAsync(
+      command,
+      (session) async {
+        final rc = await session.getReturnCode();
+        if (rc != null && rc.isValueSuccess()) {
+          completer.complete();
+        } else if (rc != null && rc.isValueCancel()) {
+          completer.completeError(StateError('FFmpeg cancelled'));
+        } else {
+          final output = await session.getOutput();
+          completer.completeError(StateError('FFmpeg failed: ${output ?? "unknown error"}'));
+        }
+      },
+      (log) { final m = log.getMessage(); if (m != null) onLog?.call(m); },
+      (stats) {
+        if (totalMs != null && totalMs > 0) {
+          final t = stats.getTime(); // processed ms
+          if (t != null) {
+            final p = (t / totalMs).clamp(0.0, 1.0);
+            onProgress?.call(p);
+          }
+        }
+      },
+    );
+
+    await completer.future;
+  }
+
+  Future<int?> _probeDurationMs(String videoPath) async {
+    try {
+      final session = await FFprobeKit.getMediaInformation(videoPath);
+      final info = await session.getMediaInformation();
+      final s = info?.getDuration();
+      if (s == null) return null;
+      final d = double.tryParse(s);
+      if (d == null) return null;
+      return (d * 1000).round();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Directory> _extractFrames(
+    File video, {
+    void Function(double p)? onProgress,
+    LogCb? onLog,
+  }) async {
     final tmp = await getTemporaryDirectory();
     final dir = Directory('${tmp.path}/frames_${_ts()}');
     await dir.create(recursive: true);
-    final cmd = ['-hide_banner','-y','-i', video.path, '${dir.path}/frame_%05d.png'].join(' ');
-    await FFmpegKit.execute(cmd);
+
+    // Try to get duration for meaningful progress
+    final durMs = await _probeDurationMs(video.path);
+
+    // If your inputs are rotated (iOS camera), add transpose to filter: -vf "fps=30,transpose=1"
+    final cmd = [
+      '-hide_banner',
+      '-y',
+      '-i', _q(video.path),
+      '${_q(dir.path)}/frame_%05d.png'
+    ].join(' ');
+
+    await _runFfmpegAndWait(
+      cmd,
+      onLog: onLog,
+      onProgress: onProgress,
+      totalMs: durMs,
+    );
+
     return dir;
   }
 
@@ -623,6 +729,8 @@ class OutputEquivRunner {
 
   List<List<double>> _zeros173() =>
       List<List<double>>.generate(17, (_) => [0.0, 0.0, 0.0], growable: false);
+
+  String _q(String s) => '"${s.replaceAll('"', '\\"')}"';
 }
 
 class YDet {
@@ -643,7 +751,11 @@ Future<OutputEquivRunner> createOutputEquivRunner({ProgressCb? onProgress}) asyn
 }
 
 /// One-shot convenience.
-Future<String> runPipelineOnVideo(File videoFile, {ProgressCb? onProgress}) async {
+Future<String> runPipelineOnVideo(
+  File videoFile, {
+  ProgressCb? onProgress,
+  LogCb? onLog,
+}) async {
   final r = await createOutputEquivRunner(onProgress: onProgress);
-  return r.runOnVideo(videoFile, onProgress: onProgress);
+  return r.runOnVideo(videoFile, onProgress: onProgress, onLog: onLog);
 }
