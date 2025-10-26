@@ -1,7 +1,7 @@
 // run_rgb_to_motionebert3d.dart
 //
 // Disk-backed, low-memory pipeline:
-// - Extracts JPG frames to /tmp (fps=15, pre-letterboxed 640x640)
+// - Extracts JPG frames to /tmp (base fps=15, but downsampled by sampleEvery=3 → 5 fps, pre-letterboxed 640x640)
 // - YOLO every N frames, holds bbox between detections
 // - RTMPose (SimCC) on crops
 // - COCO->H36M mapping
@@ -11,14 +11,11 @@
 // Requires pubspec:
 //   flutter_onnxruntime, image, ffmpeg_kit_flutter_new, path_provider
 //
-// Change in this file:
-// - All logging and progress callbacks are now wrapped in _sLog/_sProgress to
-//   avoid user callback exceptions propagating into native code or isolates.
-// - NEW: Auto-tune RTMPose preprocessing (rgb_255 / bgr_255 / rgb_ms / bgr_ms)
-//   on the first crop; then reuse the best mode for the whole run.
-// - NEW: Prefer Core ML EP on Apple by ordering providers [CORE_ML, XNNPACK, CPU].
-// - NEW: `runPipelineOnVideoInIsolate` helper to run the whole pipeline
-//        on a background isolate (logs via debugPrint inside the isolate).
+// Memory fixes:
+// - Create YOLO/RTM sessions first (CORE_ML preferred). Dispose them BEFORE creating
+//   MotionBERT. Then create MB with providers [XNNPACK, CPU] (lower peak RAM on iOS).
+// - Best-effort dynamic disposal of OrtSession across plugin versions.
+// - Reuse Float32 buffers; process frames one-by-one.
 
 import 'dart:async';
 import 'dart:convert';
@@ -39,6 +36,11 @@ typedef ProgressCb = void Function(double progress, String stage);
 typedef LogCb = void Function(String line);
 
 class _Cfg {
+  // Frame subsampling: process every Nth frame of the original 15 fps decode.
+  // N=3 → 5 fps effective processing rate (1/3 of frames).
+  int sampleEvery = 3;
+  int baseExtractFps = 15;
+
   // YOLO
   late String yoloModelAsset;
   int yoloInH = 640, yoloInW = 640;
@@ -89,10 +91,13 @@ class DiskBackedPoseRunner {
   final int yoloStride;
 
   late final OnnxRuntime _ort;
-  late OrtSession _yolo, _rtm, _mb;
+  late OrtSession _yolo, _rtm;
+  OrtSession? _mb; // created later to reduce peak memory
 
-  late String _yoloInName, _rtmInName, _mbInName;
-  late List<String> _yoloOutNames, _rtmOutNames, _mbOutNames;
+  late String _yoloInName, _rtmInName;
+  late List<String> _yoloOutNames, _rtmOutNames;
+  String? _mbInName;
+  List<String>? _mbOutNames;
 
   // Reused Float32 buffers to avoid churn
   late final Float32List _yoloBuf;
@@ -100,18 +105,14 @@ class DiskBackedPoseRunner {
 
   // Safe log/progress wrappers
   void _sLog(LogCb? cb, String msg) {
-    try { cb?.call(msg); } catch (e, st) {
-      debugPrint('onLog threw: $e\n$st');
-    }
+    try { cb?.call(msg); } catch (e, st) { debugPrint('onLog threw: $e\n$st'); }
     debugPrint(msg);
   }
   void _sProgress(ProgressCb? cb, double p, String stage) {
-    try { cb?.call(p, stage); } catch (e, st) {
-      debugPrint('onProgress threw: $e\n$st');
-    }
+    try { cb?.call(p, stage); } catch (e, st) { debugPrint('onProgress threw: $e\n$st'); }
   }
 
-  // ---- NEW: RTM auto-tune state ----
+  // ---- RTM auto-tune state ----
   String? _rtmPreprocChosen; // once decided, reused for all frames
   final List<String> _rtmTryModes = const ['rgb_255', 'bgr_255', 'rgb_ms', 'bgr_ms'];
   final double _rtmAutoThresh = 0.02; // if first-crop mean conf is below this, try other modes
@@ -165,40 +166,35 @@ class DiskBackedPoseRunner {
     final rOut = (rtmCfg['model']?['output'] ?? {}) as Map;
     cfg.simccRatio = ((rOut['simcc'] ?? {}) as Map)['split_ratio']?.toDouble() ?? 2.0;
 
-    // MotionBERT
+    // MotionBERT (we only read config here; the session is created later)
     cfg.mbModelAsset = (mbCfg['model']?['path'] ?? 'assets/models/motionbert_3d_243.onnx') as String;
     cfg.T = (mbCfg['model']?['input']?['sequence_length'] ?? 243) as int;
     cfg.rootRel = (mbCfg['model']?['output']?['root_relative'] ?? false) as bool;
     cfg.wrapPad = (mbCfg['runtime']?['wrap_pad_sequence'] ?? true) as bool;
 
-    _sProgress(onProgress, 0.06, 'Creating ONNX sessions');
+    _sProgress(onProgress, 0.06, 'Creating YOLO/RTM sessions');
     _ort = OnnxRuntime();
 
-    // ---- ONLY NECESSARY CHANGE #1: Prefer Core ML, then XNNPACK, then CPU.
-    final providers = <OrtProvider>[
-      OrtProvider.CORE_ML, // Core ML EP on Apple
+    // Prefer Core ML EP on Apple for 2D, then XNNPACK, then CPU.
+    final providers2D = <OrtProvider>[
+      OrtProvider.CORE_ML,
       OrtProvider.XNNPACK,
       OrtProvider.CPU,
     ];
-    final opts = OrtSessionOptions(providers: providers);
+    final opts2D = OrtSessionOptions(providers: providers2D);
 
-    _yolo = await _ort.createSessionFromAsset(cfg.yoloModelAsset, options: opts);
-    _rtm  = await _ort.createSessionFromAsset(cfg.rtmModelAsset,  options: opts);
-    _mb   = await _ort.createSessionFromAsset(cfg.mbModelAsset,   options: opts);
+    _yolo = await _ort.createSessionFromAsset(cfg.yoloModelAsset, options: opts2D);
+    _rtm  = await _ort.createSessionFromAsset(cfg.rtmModelAsset,  options: opts2D);
 
     _yoloInName   = _yolo.inputNames.first;
     _rtmInName    = _rtm.inputNames.first;
-    _mbInName     = _mb.inputNames.first;
     _yoloOutNames = _yolo.outputNames.toList();
     _rtmOutNames  = _rtm.outputNames.toList();
-    _mbOutNames   = _mb.outputNames.toList();
 
-    // [LOG] Providers + model I/O names
-    _sProgress(onProgress, 0.065, 'Sessions ready');
-    _sLog(onLog, '[YOLO] in=${_yoloInName} outs=${_yoloOutNames.join(",")}');
-    _sLog(onLog, '[RTM]  in=${_rtmInName}  outs=${_rtmOutNames.join(",")}');
-    _sLog(onLog, '[MB]   in=${_mbInName}   outs=${_mbOutNames.join(",")}');
-    _sLog(onLog, '[EPs]  requested=[CORE_ML, XNNPACK, CPU]'); // choice is logged here
+    _sProgress(onProgress, 0.065, '2D sessions ready');
+    _sLog(onLog, '[YOLO] in=$_yoloInName outs=${_yoloOutNames.join(",")}');
+    _sLog(onLog, '[RTM]  in=$_rtmInName  outs=${_rtmOutNames.join(",")}');
+    _sLog(onLog, '[EPs]  2D requested=[CORE_ML, XNNPACK, CPU]');
 
     // Reusable buffers
     _yoloBuf = Float32List(3 * cfg.yoloInH * cfg.yoloInW);
@@ -215,7 +211,7 @@ class DiskBackedPoseRunner {
     final outDir = Directory('${docs.path}/run_${_ts()}');
     await outDir.create(recursive: true);
 
-    // Pass 0: extract frames (JPG, fps=15, pre-letterbox to 640x640)
+    // Pass 0: extract frames (JPG, base fps=15 → downsampled to 5 fps with sampleEvery=3)
     _sProgress(onProgress, 0.08, 'Extracting frames');
     final framesDir = await _extractFrames(
       videoFile,
@@ -229,7 +225,7 @@ class DiskBackedPoseRunner {
         .cast<File>()
         .toList();
     frames.sort((a,b)=>a.path.compareTo(b.path));
-    if (frames.isEmpty) throw Exception('No frames decoded from video.');
+    if (frames.isEmpty) { throw Exception('No frames decoded from video.'); }
 
     final first = img.decodeJpg(await frames.first.readAsBytes());
     if (first == null) throw Exception('Failed to decode first frame.');
@@ -238,7 +234,7 @@ class DiskBackedPoseRunner {
     final total = frames.length;
     _sProgress(onProgress, 0.12, 'Running YOLO/RTMPose');
 
-    // Compact per-frame results; JSON written at the end.
+    // Per-frame results; JSON written at the end.
     final yoloBboxesNorm = <List<double>>[];
     final yoloScores     = <double>[];
     final seqCocoXYC     = <List<List<double>>>[];  // [F][17][3]
@@ -250,7 +246,7 @@ class DiskBackedPoseRunner {
       final frame = img.decodeJpg(bytes);
       if (frame == null) continue;
 
-      // YOLO every yoloStride frames, hold previous otherwise
+      // YOLO every yoloStride frames among the kept (downsampled) frames
       List<double> box; double score = 0.0;
       if (fi % yoloStride == 0 || _prevBox == null) {
         double ratio = 1.0; List<double> pads = [0.0,0.0,0.0,0.0];
@@ -358,7 +354,7 @@ class DiskBackedPoseRunner {
           for (final p in cocoXYC) { dot(p[0], p[1], 0,255,0); }
           final tmp = await getTemporaryDirectory();
           final fpath = '${tmp.path}/crop_vis_$fi.jpg';
-          await File(fpath).writeAsBytes(img.encodeJpg(vis, quality: 92));
+          await File(fpath).writeAsBytes(img.encodeJpg(vis, quality: 88));
           _sLog(onLog, '[DBG] wrote $fpath');
         }
 
@@ -369,13 +365,29 @@ class DiskBackedPoseRunner {
 
       final p = 0.12 + 0.78 * (fi + 1) / total;
       _sProgress(onProgress, p, 'Frames ${fi + 1}/$total');
+
+      // Yield to UI/GC occasionally
       if ((fi & 3) == 0) { await Future<void>.delayed(const Duration(milliseconds: 1)); }
     }
 
-    // MotionBERT input
+    // ---- MEMORY FIX: free 2D sessions before MotionBERT, hint GC, then create MB with CPU/XNNPACK.
     _sProgress(onProgress, 0.91, 'Preparing MotionBERT input');
     _sLog(onLog, '[RTM] run_mean_conf=${_meanConfSeq(seqCocoXYC).toStringAsFixed(4)} '
                  '(preproc=${_rtmPreprocChosen ?? cfg.rtmPreproc})');
+
+    await _tryDisposeSession(_yolo);
+    await _tryDisposeSession(_rtm);
+    _sLog(onLog, '[EPs]  disposed YOLO/RTM sessions to free memory');
+    await Future<void>.delayed(const Duration(milliseconds: 20)); // give GC a moment
+
+    // Create MotionBERT session with lean providers
+    final providersMB = <OrtProvider>[OrtProvider.XNNPACK, OrtProvider.CPU];
+    final optsMB = OrtSessionOptions(providers: providersMB);
+    _mb = await _ort.createSessionFromAsset(cfg.mbModelAsset, options: optsMB);
+    _mbInName     = _mb!.inputNames.first;
+    _mbOutNames   = _mb!.outputNames.toList();
+    _sLog(onLog, '[MB]   in=$_mbInName  outs=${_mbOutNames!.join(",")}');
+    _sLog(onLog, '[EPs]  MB requested=[XNNPACK, CPU]');
 
     final mbSeq = _buildMbSequence(seqH36MXYC, inW, inH, T: cfg.T, wrapPad: cfg.wrapPad);
 
@@ -388,12 +400,17 @@ class DiskBackedPoseRunner {
       }
     }
     final mbInVal = await OrtValue.fromList(mbFlat, [1, cfg.T, 17, 3]);
-    final mbRes   = await _mb.run({_mbInName: mbInVal});
+    final mbRes   = await _mb!.run({_mbInName!: mbInVal});
     await mbInVal.dispose();
-    final mbTensor = mbRes[_mbOutNames.first]!;
+    final mbTensor = mbRes[_mbOutNames!.first]!;
     final mbShape  = mbTensor.shape; // [1,T,17,3]
     final mbData   = (await mbTensor.asFlattenedList()).cast<double>();
     for (final v in mbRes.values) { await v.dispose(); }
+
+    // We can now dispose MB to lower memory before JSON writing
+    await _tryDisposeSession(_mb);
+    _mb = null;
+
     final coords3d = _reshape3d(mbData, mbShape[1], mbShape[2], mbShape[3]);
     if (cfg.rootRel) { for (int t = 0; t < coords3d.length; t++) { coords3d[t][0] = [0.0,0.0,0.0]; } }
 
@@ -448,10 +465,6 @@ class DiskBackedPoseRunner {
     }
   }
 
-  (List<double>, List<double>, bool) _rtmPreprocTriplet() {
-    return _rtmPreprocTripletFor(_rtmPreprocChosen ?? cfg.rtmPreproc);
-  }
-
   Future<(List<List<double>>, double)> _rtmOnceWithMode(
     img.Image crop, List<double> rect, String mode, double splitRatio) async {
 
@@ -491,8 +504,11 @@ class DiskBackedPoseRunner {
 
     final durMs = await _probeDurationMs(video.path);
 
+    // Downsample at extraction: baseExtractFps / sampleEvery (min 1)
+    final outFps = math.max(1, (cfg.baseExtractFps / cfg.sampleEvery).floor());
+
     final vf = [
-      'fps=15',
+      'fps=$outFps',
       'scale=640:640:force_original_aspect_ratio=decrease',
       'pad=640:640:(ow-iw)/2:(oh-ih)/2:color=0x727272',
       'format=rgb24',
@@ -503,7 +519,7 @@ class DiskBackedPoseRunner {
       '-y',
       '-i', _q(video.path),
       '-vf', _q(vf),
-      '-q:v', '3',
+      '-q:v', '3', // jpg quality (lower for smaller files)
       '${_q(dir.path)}/frame_%05d.jpg'
     ].join(' ');
 
@@ -528,10 +544,7 @@ class DiskBackedPoseRunner {
         final output = await session.getOutput();
         completer.completeError(StateError('FFmpeg failed: ${output ?? "unknown error"}'));
       },
-      (log) {
-        final m = log.getMessage();
-        if (m != null) _sLog(onLog, m);
-      },
+      (log) { final m = log.getMessage(); if (m != null) _sLog(onLog, m); },
       (stats) {
         if (totalMs != null && totalMs > 0) {
           final t = stats.getTime();
@@ -821,12 +834,41 @@ class DiskBackedPoseRunner {
       List<List<double>>.generate(17, (_) => [0.0, 0.0, 0.0], growable: false);
 
   String _q(String s) => '"${s.replaceAll('"', '\\"')}"';
+
+  // ---- best-effort session disposal (works across plugin versions) ----
+  Future<void> _tryDisposeSession(Object? sess) async {
+    if (sess == null) return;
+    try {
+      final fn = (sess as dynamic).dispose;
+      if (fn is Function) {
+        final r = fn();
+        if (r is Future) await r;
+        return;
+      }
+    } catch (_) {}
+
+    try {
+      final fn = (sess as dynamic).release;
+      if (fn is Function) {
+        final r = fn();
+        if (r is Future) await r;
+        return;
+      }
+    } catch (_) {}
+
+    try {
+      final fn = (sess as dynamic).close;
+      if (fn is Function) {
+        final r = fn();
+        if (r is Future) await r;
+        return;
+      }
+    } catch (_) {}
+  }
 }
 
 // ------------- Compatibility helpers -------------
 
-/// Keep your old call-sites working.
-/// This simply constructs the disk-backed runner and runs the 3-pass pipeline.
 Future<String> runPipelineOnVideo(
   File videoFile, {
   ProgressCb? onProgress,
@@ -838,29 +880,17 @@ Future<String> runPipelineOnVideo(
   return r.runThreePassOnVideo(videoFile, onProgress: onProgress, onLog: onLog);
 }
 
-/// NEW: Run the whole pipeline on a background isolate.
-/// NOTE: Callbacks (onProgress/onLog) can’t be sent across isolates; this uses
-/// debugPrint inside the isolate to log EP choices & auto-tuned preprocessing.
-/// If you need UI progress, keep using `runPipelineOnVideo` on the main isolate.
 Future<String> runPipelineOnVideoInIsolate(
   File videoFile, {
   int yoloStride = 2,
 }) async {
-  // `Isolate.run` executes the closure on a worker isolate and returns the result.
-  // See: https://dart.dev/language/isolates
   return await Isolate.run(() async {
     final r = DiskBackedPoseRunner(yoloStride: yoloStride);
-    await r.initFromAssets(
-      // These won't cross isolates; logs will go via debugPrint inside.
-      onProgress: null,
-      onLog: null,
-    );
+    await r.initFromAssets(onProgress: null, onLog: null);
     return r.runThreePassOnVideo(videoFile, onProgress: null, onLog: null);
   });
 }
 
-/// If you want to keep the object around (e.g., run multiple videos without
-/// recreating sessions), use this.
 Future<DiskBackedPoseRunner> createDiskBackedRunner({
   ProgressCb? onProgress,
   LogCb? onLog,
