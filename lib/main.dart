@@ -1,100 +1,33 @@
-// main.dart
+// lib/main.dart
+//
+// Minimal UI to run either:
+//  - Offline pipeline (pick a video, process, write artifacts)
+//  - Live pipeline (start/stop recording, process during capture, write artifacts)
+//
+// This app only shows status text; no preview is required (your native capture
+// is headless for inference and writes the .mp4 to runDir).
+
 import 'dart:async';
-import 'dart:developer' as developer;
 import 'dart:io';
-import 'dart:ui' as ui show PlatformDispatcher;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart' show FlutterError, debugPrint;
 import 'package:image_picker/image_picker.dart';
-
-// Legacy API (pre-11)
-import 'package:share_plus/share_plus.dart'; // provides Share.shareXFiles
-import 'package:cross_file/cross_file.dart';
-
 import 'package:path_provider/path_provider.dart';
 
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit_config.dart';
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
+import 'run_rgb_offline.dart';
+import 'run_rgb_live.dart';
 
-import 'run_rgb_to_motionbert3d.dart';
-
-// -------------------- global logging helpers --------------------
-
-late IOSink _fileSink;
-
-Future<void> _initFileLogger() async {
-  final docs = await getApplicationDocumentsDirectory();
-  final f = File('${docs.path}/pose_run.log');
-  _fileSink = f.openWrite(mode: FileMode.append);
-  debugPrint('📄 File logging -> ${f.path}');
-}
-
-void _logToAll(String msg, {Object? error, StackTrace? stack}) {
-  final line = '[${DateTime.now().toIso8601String()}] $msg'
-      '${error != null ? '\nERROR: $error' : ''}'
-      '${stack != null ? '\n$stack' : ''}';
-  debugPrint(line);
-  developer.log(msg, error: error, stackTrace: stack);
-  try {
-    _fileSink.writeln(line);
-    _fileSink.flush();
-  } catch (_) {
-    // ignore file errors; keep app running
-  }
-}
-
-Future<void> _initFfmpegLogging() async {
-  // FFmpegKit native logs -> our logger
-  FFmpegKitConfig.enableLogCallback((log) {
-    final m = log.getMessage();
-    if (m != null) _logToAll('[FFmpeg] $m');
-  });
-
-  // FFmpegKit statistics -> our logger
-  FFmpegKitConfig.enableStatisticsCallback((stats) {
-    final t = stats.getTime();      // ms
-    final s = stats.getSize();      // bytes
-    final sp = stats.getSpeed();    // e.g. 2.0x (double)
-    _logToAll('[FFmpeg] stats t=${t ?? -1}ms size=${s ?? -1}B speed=${sp ?? 0}');
-  });
-}
-
-// -------------------- main() with robust error catching --------------------
-
-Future<void> main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  await _initFileLogger();
-  await _initFfmpegLogging();
-
-  // Catch framework errors
-  FlutterError.onError = (details) {
-    _logToAll('Flutter error', error: details.exception, stack: details.stack);
-  };
-
-  // Catch uncaught async errors on the UI/platform dispatcher
-  ui.PlatformDispatcher.instance.onError = (error, stack) {
-    _logToAll('PlatformDispatcher error', error: error, stack: stack);
-    return true; // handled
-  };
-
-  // Catch everything else
-  runZonedGuarded(() {
-    runApp(const PoseApp());
-  }, (error, stack) {
-    _logToAll('Uncaught (zone)', error: error, stack: stack);
-  });
+  runApp(const PoseApp());
 }
-
-// -------------------- UI --------------------
 
 class PoseApp extends StatelessWidget {
   const PoseApp({super.key});
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Pose Estimation',
+      title: 'Live/Offline Pose',
       theme: ThemeData(useMaterial3: true),
       home: const PoseHome(),
     );
@@ -108,92 +41,180 @@ class PoseHome extends StatefulWidget {
 }
 
 class _PoseHomeState extends State<PoseHome> {
+  String _log = '';
   String? _lastRunDir;
   bool _busy = false;
-  String _log = '';
 
-  Future<void> _pickAndRun() async {
+  // Live session
+  Live2DSession? _live;
+  bool _liveRunning = false;
+
+  // Live log subscription (to see logs on-device even if USB debug drops)
+  StreamSubscription<String>? _liveLogSub;
+  final StringBuffer _liveLogBuffer = StringBuffer();
+  Timer? _liveFlushTimer;
+
+  void _append(String s) {
+    setState(() {
+      _log = _log.isEmpty ? s : '$_log\n$s';
+    });
+  }
+
+  // ---------------- OFFLINE ----------------
+
+  Future<void> _runOffline() async {
+    if (_busy) return;
     final picker = ImagePicker();
-    final picked = await picker.pickVideo(source: ImageSource.gallery);
-    if (picked == null) return;
+    final x = await picker.pickVideo(source: ImageSource.gallery);
+    if (x == null) return;
 
     setState(() {
       _busy = true;
-      _log = 'Running YOLO → RTMPose → MotionBERT…\n';
+      _log = 'Offline pipeline started…';
     });
 
-    // simple throttle to avoid too-frequent setState() calls
-    DateTime lastUiUpdate = DateTime.now();
-
-    String appendAndMaybePaint(String current, String line) {
-      final now = DateTime.now();
-      final next = current.isEmpty ? line : '$current\n$line';
-      if (now.difference(lastUiUpdate).inMilliseconds > 150 && mounted) {
-        lastUiUpdate = now;
-        setState(() => _log = next);
-      }
-      return next;
-    }
-
     try {
-      String uiLog = _log;
-
-      final outDirPath = await runPipelineOnVideo(
-        File(picked.path),
-        onLog: (s) {
-          _logToAll(s);                          // file + console
-          uiLog = appendAndMaybePaint(uiLog, s); // on-screen
-        },
-        onProgress: (p, stage) {
-          final line = '${(p * 100).toStringAsFixed(1)}%  $stage';
-          _logToAll(line);                       // file + console
-          uiLog = appendAndMaybePaint(uiLog, line); // on-screen
-        },
+      final outDir = await runPipelineOnVideoOffline(
+        File(x.path),
+        sampleEvery: 3, // process 1/3 frames → ~5 fps from 15 fps extraction
+        yoloStride: 2, // YOLO every 2 processed frames (~2.5 Hz)
+        onProgress: (p, s) => _append('${(p * 100).toStringAsFixed(1)}%  $s'),
+        onLog: (l) => _append(l),
       );
-
-      if (!mounted) return;
       setState(() {
-        _lastRunDir = outDirPath;
-        _log = '$uiLog\n\nDone.\nSaved results to:\n$outDirPath\n'
-               'Files:\n- yolo_out.json\n- rtm_out.json\n- motionbert_out.json';
+        _lastRunDir = outDir;
+        _append('✅ Offline done → $outDir');
       });
     } catch (e, st) {
-      _logToAll('Pipeline error', error: e, stack: st);
-      if (mounted) setState(() => _log = 'Error: $e');
+      _append('❌ Offline error: $e\n$st');
     } finally {
-      if (mounted) setState(() => _busy = false);
+      setState(() {
+        _busy = false;
+      });
     }
   }
 
-  Future<void> _shareResults() async {
-    if (_lastRunDir == null) return;
-    final dir = Directory(_lastRunDir!);
-    final files = [
-      XFile('${dir.path}/yolo_out.json'),
-      XFile('${dir.path}/rtm_out.json'),
-      XFile('${dir.path}/motionbert_out.json'),
-    ];
-    await Share.shareXFiles(files, text: 'Pose estimation results');
+  // ---------------- LIVE ----------------
+
+  Future<void> _startLive() async {
+    if (_busy || _liveRunning) return;
+    setState(() {
+      _busy = true;
+      _log = 'Starting live capture…';
+    });
+
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final runDir =
+          Directory('${docs.path}/run_live_${DateTime.now().millisecondsSinceEpoch}');
+      await runDir.create(recursive: true);
+
+      _live = Live2DSession();
+      await _live!.start(runDir: runDir, target2dFps: 10, yoloStride: 2);
+
+      // Subscribe to on-device live logs; throttle UI updates to avoid jank
+      _liveLogSub = _live!.logStream.listen((line) {
+        _liveLogBuffer.writeln(line);
+        _liveFlushTimer ??= Timer(const Duration(milliseconds: 200), () {
+          if (!mounted) return;
+          setState(() {
+            final chunk = _liveLogBuffer.toString();
+            if (chunk.isNotEmpty) {
+              _log = _log.isEmpty ? chunk : '$_log\n$chunk';
+            }
+            _liveLogBuffer.clear();
+          });
+          _liveFlushTimer = null;
+        });
+      });
+
+      setState(() {
+        _liveRunning = true;
+        _append('🎥 Live running. Press STOP to finish.');
+      });
+    } catch (e, st) {
+      _append('❌ Live start error: $e\n$st');
+    } finally {
+      setState(() {
+        _busy = false;
+      });
+    }
+  }
+
+  Future<void> _stopLive() async {
+    if (_busy || !_liveRunning || _live == null) return;
+    setState(() {
+      _busy = true;
+      _append('Stopping live capture…');
+    });
+
+    try {
+      final outDir = await _live!.stopAndFinalize();
+      setState(() {
+        _lastRunDir = outDir;
+        _append('✅ Live done → $outDir');
+      });
+    } catch (e, st) {
+      _append('❌ Live stop error: $e\n$st');
+    } finally {
+      // Tear down live log subscription and timers
+      await _liveLogSub?.cancel();
+      _liveLogSub = null;
+      _liveFlushTimer?.cancel();
+      _liveFlushTimer = null;
+      _liveLogBuffer.clear();
+
+      _liveRunning = false;
+      _live = null;
+      setState(() {
+        _busy = false;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _liveLogSub?.cancel();
+    _liveFlushTimer?.cancel();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final canShare = _lastRunDir != null && !_busy;
+    final runLabel = _lastRunDir == null ? '' : '\nOutput: $_lastRunDir';
 
     return Scaffold(
-      appBar: AppBar(title: const Text('YOLO → RTMPose → MotionBERT')),
+      appBar: AppBar(title: const Text('YOLO → RTMPose → MotionBERT (Live/Offline)')),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            ElevatedButton.icon(
-              onPressed: _busy ? null : _pickAndRun,
-              icon: const Icon(Icons.upload),
-              label: const Text('Pick video from gallery'),
+            Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              children: [
+                ElevatedButton.icon(
+                  onPressed: _busy ? null : _runOffline,
+                  icon: const Icon(Icons.video_file),
+                  label: const Text('Run OFFLINE (pick video)'),
+                ),
+                if (!_liveRunning)
+                  ElevatedButton.icon(
+                    onPressed: _busy ? null : _startLive,
+                    icon: const Icon(Icons.fiber_manual_record),
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                    label: const Text('START LIVE'),
+                  ),
+                if (_liveRunning)
+                  ElevatedButton.icon(
+                    onPressed: _busy ? null : _stopLive,
+                    icon: const Icon(Icons.stop),
+                    style:
+                        ElevatedButton.styleFrom(backgroundColor: Colors.black87),
+                    label: const Text('STOP LIVE'),
+                  ),
+              ],
             ),
-            const SizedBox(height: 12),
-            if (_lastRunDir != null)
-              SelectableText('Output: $_lastRunDir', maxLines: 4),
             const SizedBox(height: 12),
             Expanded(
               child: Container(
@@ -203,15 +224,9 @@ class _PoseHomeState extends State<PoseHome> {
                   border: Border.all(color: Colors.black12),
                   borderRadius: BorderRadius.circular(12),
                 ),
-                child: SingleChildScrollView(child: Text(_log)),
+                child: SingleChildScrollView(child: Text('$_log$runLabel')),
               ),
             ),
-            if (_lastRunDir != null)
-              ElevatedButton.icon(
-                onPressed: canShare ? _shareResults : null,
-                icon: const Icon(Icons.share),
-                label: const Text('Share results'),
-              ),
           ],
         ),
       ),
